@@ -6,11 +6,12 @@ engine = create_engine(
 
 with engine.connect() as conn:
     result = conn.execute(text("""
-        select s.key, o.period_date, o.value
+        select count(*)
         from observations o
         join series s on s.id=o.series_id
-        limit 10
+        join sources src on src.id=s.source_id
+        where src.name='fredmd'
     """))
 
-    for row in result:
-        print(row)
+    print(result.scalar())
+

@@ -53,6 +53,28 @@ create table if not exists ingestion_log (
   rows_failed bigint not null default 0,
   details jsonb not null default '{}'::jsonb
 );
+
+create table if not exists indicators (
+  id bigserial primary key,
+  code text not null unique,   -- GDP, CPI, UNEMP
+  name text,
+  description text,
+  created_at timestamptz default now()
+);
+
+create table if not exists releases (
+  id bigserial primary key,
+  source_id bigint references sources(id),
+  release_time timestamptz not null,
+  description text,
+  meta jsonb default '{}'::jsonb
+);
+
+alter table series
+add column if not exists indicator_id bigint references indicators(id);
+
+alter table observations
+add column if not exists release_id bigint references releases(id);
 """
 
 with engine.begin() as conn:
