@@ -65,31 +65,31 @@ def download_current_fredmd_csv() -> Path:
 
 def parse_fredmd(csv_path: Path) -> tuple[pd.DataFrame, dict]:
     """
-    Возвращает:
-    - df_wide: индекс = даты, колонки = переменные
-    - meta: общая метаинформация (например, tcodes если они есть)
+    Grazina:
+    - df_wide: indeksas = datos, stulpelis = kintamieji
+    - meta: bendra metainfo (pvz, tcodes jei yra)
     """
     df = pd.read_csv(csv_path)
 
-    # Обычно первая колонка sasdate
-    # Иногда в FRED-MD есть строка с tcodes (трансформационные коды).
-    # Попробуем детектировать: если в первой колонке лежит 'transform'/'tcode' — это строка кодов.
+    #Dazniausiai pirmas stulpialis yra sasdate
+    #Kartais FRED-MD turi eiluciu su tcodes.
+    #Jei pirmas stulpelis yra 'transform'/'tcode' — tai kodu eilute.
     first_col = df.columns[0]
     meta = {}
 
     if str(df.iloc[0, 0]).strip().lower() in {"transform", "tcode", "tcodes"}:
-        # первая строка содержит коды трансформаций для каждой переменной
+        #transformaciju kodai
         tcodes = df.iloc[0].to_dict()
         tcodes.pop(first_col, None)
         meta["tcodes"] = tcodes
         df = df.iloc[1:].copy()
 
-    # Парсим даты
+    #Dates parsing
     df[first_col] = pd.to_datetime(df[first_col], errors="coerce")
     df = df.dropna(subset=[first_col])
     df = df.set_index(first_col).sort_index()
 
-    # Все остальные колонки — числовые
+    #kiti stulpeliai su skaiciais
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -105,19 +105,19 @@ def ingest(df_wide: pd.DataFrame, dataset_meta: dict, observed_at: str):
     with engine.begin() as conn:
         source_id = ensure_source(conn, source_name)
 
-        # Если тебе нужны НЕ все переменные — сделай здесь фильтр:
+        # galima daryti filtra jei reikalingi nevisi kintamieji:
         # keep = ["INDPRO", "UNRATE", "CPIAUCSL"]
         # df_wide = df_wide[keep]
         country = "US"
         freq = "M"
         transform = "LEVEL"
-        unit = None  # в FRED-MD единицы не всегда в файле; можно оставить NULL
+        unit = None
 
         for var in df_wide.columns:
             series_meta = {
                 "dataset": "FRED-MD",
                 "variable": var,
-                "dataset_meta": dataset_meta,  # tcodes и т.п.
+                "dataset_meta": dataset_meta,  # tcodes ir t.t.
             }
             series_id = ensure_series(
                 conn=conn,
@@ -131,8 +131,8 @@ def ingest(df_wide: pd.DataFrame, dataset_meta: dict, observed_at: str):
                 meta=series_meta
             )
 
-            # Вставляем наблюдения (помесячно)
-            # period_date = первый день месяца (удобно и стабильно)
+            #observations (menesinio daznio)
+            #period_date = pirma menesio diena
             for dt, val in df_wide[var].items():
                 if pd.isna(val):
                     continue
@@ -173,7 +173,7 @@ if __name__ == "__main__":
     observed_at = datetime.now(timezone.utc).isoformat()
     ingest(df_wide, dataset_meta, observed_at)
 
-    # Быстрый чек
+    #greita patikra
     with engine.connect() as conn:
         n_series = conn.execute(text("select count(*) from series where source_id = (select id from sources where name='fredmd')")).scalar_one()
         n_obs = conn.execute(text("""

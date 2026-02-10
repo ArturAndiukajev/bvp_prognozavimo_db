@@ -1,51 +1,27 @@
 import logging
+import yaml
+from pathlib import Path
 from datetime import datetime, timezone
 import pandas as pd
 from sqlalchemy import create_engine, text
 from pytrends.request import TrendReq
 
 # Logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # DB
 DB_URL = "postgresql+psycopg2://nowcast:nowcast@localhost:5432/nowcast_db"
 engine = create_engine(DB_URL, future=True)
 
-# Config
-TIMEFRAME = "2004-01-01 2025-03-31"
-COUNTRIES = {
-    "LT": "LT",
-    "US": "US"
-}
+CONFIG_PATH = Path(__file__).parent.parent / "config" / "datasets.yaml"
 
-KEYWORDS = [
-    "crisis", "Auto insurance", "house prices", "Immigration", "inflation", "business",
-    "tourism", "credit", "prices", "export", "import", "Energy", "work", "Loan",
-    "Food prices", "unemployment", "Economy", "housing crisis", "emigration",
-    "fuel price", "Circular economy", "recession", "slowdown", "recovery",
-    "manufacturing", "production", "supply chain", "demand", "cost of living",
-    "consumer sentiment", "consumer confidence", "disposable income", "wage growth",
-    "wage stagnation", "wage cuts", "layoffs", "bankruptcy", "insolvency",
-    "housing market", "real estate", "mortgage rates", "interest rate",
-    "central bank", "monetary policy", "fiscal policy", "government debt",
-    "budget deficit", "inflation expectations", "commodity prices", "raw materials",
-    "industrial output", "retail sales", "e-commerce growth", "digital transformation",
-    "investment", "foreign direct investment", "capital flows", "exchange rate",
-    "currency depreciation", "trade war", "tariffs", "sanctions",
-    "supply disruption", "logistics bottleneck", "stock market crash",
-    "asset bubble", "over-capacity", "under-employment", "shadow economy",
-    "gray economy", "corporate profits", "margin squeeze", "deflation",
-    "stagflation", "credit crunch", "bank run", "non-performing loans",
-    "financial stability", "wealth inequality", "social unrest", "migration flows",
-    "demographic change", "ageing population", "labor shortage", "automation",
-    "green transition", "climate risk", "energy transition", "resource depletion",
-    "housing affordability", "rental market", "housing bubble", "transportation cost",
-    "logistics cost", "infrastructure investment", "public investment",
-    "private consumption", "consumer spending", "business confidence",
-    "corporate investment"
-]
-
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        logger.error(f"Config file not found at {CONFIG_PATH}")
+        return {}
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 def ensure_source(conn):
     conn.execute(text("""
@@ -77,7 +53,9 @@ def ensure_series(conn, source_id, keyword, country):
 
 def insert_observations(conn, series_id, df):
     observed_at = datetime.now(timezone.utc)
-
+    
+    # df index is date, column 'value' exists
+    inserted = 0
     for date, row in df.iterrows():
         value = row["value"]
 
@@ -94,54 +72,88 @@ def insert_observations(conn, series_id, df):
             "obs": observed_at,
             "val": float(value)
         })
+        inserted += 1
+    return inserted
 
 
 def monthly_from_weekly(df):
     df.index = pd.to_datetime(df.index)
     monthly = df.resample("MS").mean()
-    monthly = monthly.rename(columns={monthly.columns[0]: "value"})
+    # Pytrends returns dataframe where column name is the keyword. Rename to 'value'
+    if not monthly.empty:
+        monthly.columns = ["value"]
     return monthly
 
 
 def chunk_keywords(lst, size=5):
+    """Google Trends API limits to 5 keywords per request"""
     for i in range(0, len(lst), size):
         yield lst[i:i + size]
 
 
-def fetch_trends():
-    pytrends = TrendReq()
+def main():
+    config = load_config()
+    gt_config = config.get("google_trends", {})
+    
+    if not gt_config:
+        logger.warning("No 'google_trends' section in config.")
+        return
+
+    keywords = gt_config.get("keywords", [])
+    geo = gt_config.get("geo", "LT")
+    
+    if not keywords:
+        logger.warning("No keywords found in google_trends config.")
+        return
+
+    pytrends = TrendReq(hl='en-US', tz=360)
+    
+    # Timeframe: Last 5 years to keep it relevant and fast? Or 'all'?
+    # 'all' is good for long history.
+    TIMEFRAME = "today 5-y" 
 
     with engine.begin() as conn:
         source_id = ensure_source(conn)
-
-        for country_name, geo in COUNTRIES.items():
-            logger.info(f"Country: {country_name}")
-
-            for batch in chunk_keywords(KEYWORDS, 5):
-                logger.info(f"Batch: {batch}")
-
-                try:
-                    pytrends.build_payload(batch, timeframe=TIMEFRAME, geo=geo)
-                    data = pytrends.interest_over_time()
-
-                    if data.empty:
+        
+        # Process in chunks of 5
+        for batch in chunk_keywords(keywords, 5):
+            logger.info(f"Fetching batch: {batch}")
+            
+            try:
+                pytrends.build_payload(batch, cat=0, timeframe=TIMEFRAME, geo=geo, gprop='')
+                data = pytrends.interest_over_time()
+                
+                if data.empty:
+                    logger.warning(f"No data for batch {batch}")
+                    continue
+                
+                # Drop partial indicator if exists
+                if 'isPartial' in data.columns:
+                    data = data.drop(columns=['isPartial'])
+                
+                for keyword in batch:
+                    if keyword not in data.columns:
+                        continue
+                        
+                    # Extract single series
+                    df_kw = data[[keyword]].copy()
+                    
+                    # Resample to Monthly (Google Trends default is weekly for 5y)
+                    df_monthly = monthly_from_weekly(df_kw)
+                    
+                    if df_monthly.empty:
                         continue
 
-                    data = data.drop(columns=["isPartial"], errors="ignore")
-
-                    for keyword in batch:
-                        if keyword not in data.columns:
-                            continue
-
-                        df_kw = data[[keyword]].rename(columns={keyword: "value"})
-                        df_kw = monthly_from_weekly(df_kw)
-
-                        series_id = ensure_series(conn, source_id, keyword, country_name)
-                        insert_observations(conn, series_id, df_kw)
-
-                except Exception as e:
-                    logger.warning(f"Failed batch {batch}: {e}")
-
+                    series_id = ensure_series(conn, source_id, keyword, geo)
+                    count = insert_observations(conn, series_id, df_monthly)
+                    logger.info(f"  {keyword}: inserted {count} rows")
+                    
+                # Be nice to Google API
+                import time
+                time.sleep(2)
+                
+            except Exception as e:
+                logger.error(f"Failed batch {batch}: {e}")
 
 if __name__ == "__main__":
-    fetch_trends()
+    main()

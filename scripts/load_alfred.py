@@ -8,11 +8,6 @@ from fredapi import Fred
 from dotenv import load_dotenv
 load_dotenv()
 
-from dotenv import load_dotenv
-
-# Load env vars from .env file
-load_dotenv()
-
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -62,7 +57,23 @@ def ensure_series(conn, source_id: int, key: str, country: str, frequency: str,
         "meta": meta_json,
     }).scalar_one()
 
-def fetch_and_ingest_series(series_id: str):
+import yaml
+from pathlib import Path
+
+# ... (Logging, DB, API setup) ...
+
+CONFIG_PATH = Path(__file__).parent.parent / "config" / "datasets.yaml"
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        logger.error(f"Config file not found at {CONFIG_PATH}")
+        return {}
+    with open(CONFIG_PATH, "r") as f:
+        return yaml.safe_load(f) or {}
+
+# ... (Helper functions ensuring source/series) ...
+
+def fetch_and_ingest_series(series_id: str, real_time: bool = True):
     if not fred:
         logger.error("FRED client not initialized.")
         return
@@ -81,30 +92,23 @@ def fetch_and_ingest_series(series_id: str):
     units = info.get('units')
     title = info.get('title')
     
-    # 2. Get All Vintages (Real-time Periods)
-    # We want to know when data was released.
-    try:
-        # This gets the dates (vintages) when the data was revised or released
-        vintage_dates = fred.get_series_vintage_dates(series_id)
-        logger.info(f"Found {len(vintage_dates)} vintages for {series_id}")
-    except Exception as e:
-        logger.error(f"Failed to get vintage dates for {series_id}: {e}")
-        return
-
-    # In a production script, we might want to filter widely to only get new vintages.
-    # For now, let's fetch the last 5 vintages to test, or all if user wants.
-    # To keep it simple and efficient for a "load" script, let's iterate over ALL, 
-    # but maybe we can optimize by only fetching data for that vintage?
-    
-    # Actually, fred.get_series_all_releases() might be better but let's stick to the standard 
-    # approach of "what was the data looking like on date X?"
-    
-    # Let's take the *latest* 5 vintages for demonstration/testing purposes
-    # straightforward loop:
-    
-    target_vintages = vintage_dates[-5:] # Last 5 updates
-    if not target_vintages:
-        target_vintages = [datetime.now()] # Fallback if no vintages found (rare)
+    # 2. Get Vintages
+    if real_time:
+        try:
+            # Get vintage dates
+            vintage_dates = fred.get_series_vintage_dates(series_id)
+            # Take last 5 for efficiency in likely usage, or all if needed.
+            # For a full history run, you might want all. For daily updates, just recent.
+            # Let's defaults to last 10 to be safe.
+            target_vintages = vintage_dates[-10:]
+            if not target_vintages:
+                target_vintages = [datetime.now()]
+        except Exception as e:
+            logger.error(f"Failed to get vintage dates for {series_id}: {e}")
+            return
+    else:
+        # Just current
+        target_vintages = [datetime.now()]
 
     with engine.begin() as conn:
         source_id = ensure_source(conn, "alfred")
@@ -114,9 +118,9 @@ def fetch_and_ingest_series(series_id: str):
             conn=conn,
             source_id=source_id,
             key=series_id,
-            country="US", # FRED is mostly US
+            country="US", # FRED default
             frequency=frequency,
-            transform="LEVEL", # Default
+            transform="LEVEL", 
             unit=units,
             name=title,
             meta={"fred_info": info.to_dict()}
@@ -129,13 +133,13 @@ def fetch_and_ingest_series(series_id: str):
             logger.info(f"Fetching vintage: {v_date_str}")
             
             try:
-                # real_time_start=v_date, real_time_end=v_date gives us the data AS IT WAS on that date.
+                # Fetch data for this vintage
                 data = fred.get_series(series_id, realtime_start=v_date_str, realtime_end=v_date_str)
                 
                 if data is None or data.empty:
                     continue
                 
-                # Insert data points
+                # Bulk insert or loop? Loop is safer for upsert conflict handling usually
                 for p_date, value in data.items():
                     if pd.isna(value):
                         continue
@@ -147,7 +151,7 @@ def fetch_and_ingest_series(series_id: str):
                     """), {
                         "sid": db_series_id,
                         "pdate": p_date.date(),
-                        "oat": v_date, # This is the vintage date
+                        "oat": v_date, 
                         "val": float(value),
                     })
                     total_inserted += 1
@@ -168,16 +172,19 @@ def fetch_and_ingest_series(series_id: str):
         logger.info(f"Finished {series_id}. Inserted {total_inserted} observations.")
 
 def main():
-    # Example usage: Fetch GDP and CPI
-    # series_to_fetch = ["GDP", "CPIAUCSL", "UNRATE"]
-    series_to_fetch = ["GDP"] # Start small
+    config = load_config()
+    alfred_config = config.get("alfred", {})
     
     if not API_KEY:
         logger.error("Stopping: No API KEY configured.")
         return
+        
+    if not alfred_config:
+        logger.warning("No 'alfred' section in config.")
+        return
 
-    for s in series_to_fetch:
-        fetch_and_ingest_series(s)
+    for series_id, details in alfred_config.items():
+        fetch_and_ingest_series(series_id, real_time=details.get("realtime", True))
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,103 @@
+yahoo_finance:
+  "^OMXV":
+    name: "OMX Vilnius Index"
+  "BZ=F":
+    name: "Brent Crude Oil"
+  "EURUSD=X":
+    name: "EUR/USD Exchange Rate"
+
+google_trends:
+  keywords:
+    - "Nedarbas"        # Unemployment
+    - "Butai"           # Apartments/Housing
+    - "Paskolos"        # Loans
+    - "Infliacija"      # Inflation
+    - "Kelionės"        # Travel
+    - "Automobiliai"    # Cars
+    - "Baldai"          # Furniture
+    - "Statybos"        # Construction
+  geo: "LT"
+
+alfred:
+  GDP:
+    name: "US GDP"
+    realtime: true
+  CPIAUCSL:
+    name: "US CPI"
+    realtime: true
+  UNRATE:
+    name: "US Unemployment Rate"
+    realtime: true
+
+eurostat:
+  namq_10_gdp:
+    name: "GDP and main components (Quarterly)"
+    filters:
+      unit: ["CLV10_MNAC", "CP_MNAC"]
+      s_adj: ["SCA"]
+      na_item: ["B1GQ", "P3", "P6", "P7"]
+      geo: ["LT"]
+
+  prc_hicp_midx:
+    name: "HICP - Harmonised Index of Consumer Prices (Monthly)"
+    filters:
+      unit: ["I15"]
+      coicop: ["CP00"]
+      geo: ["LT"]
+
+  une_rt_m:
+    name: "Unemployment by sex and age (Monthly)"
+    filters:
+      unit: ["PC_ACT"]
+      s_adj: ["SA"]
+      age: ["TOTAL"]
+      sex: ["T"]
+      geo: ["LT"]
+
+  sts_inpr_m:
+    name: "Industrial production (Monthly)"
+    filters:
+      unit: ["I15"]
+      s_adj: ["SCA"]
+      nace_r2: ["B-D"]
+      geo: ["LT"]
+
+  sts_copr_m:
+    name: "Production in construction (Monthly)"
+    filters:
+      unit: ["I15"]
+      s_adj: ["SCA"]
+      indic_bt: ["PROD"]
+      nace_r2: ["F"]
+      geo: ["LT"]
+
+  sts_trtu_m:
+    name: "Retail trade volume (Monthly)"
+    filters:
+      unit: ["I15"]
+      s_adj: ["SCA"]
+      nace_r2: ["G47"]
+      geo: ["LT"]
+
+  ei_bcs_bs:
+    name: "Business and consumer surveys (Monthly)"
+    filters:
+      indic: ["BS-ESI-I"] # Economic Sentiment Indicator
+      s_adj: ["SA"]
+      geo: ["LT"]
+
+  sts_inpp_m:
+    name: "Industrial producer prices (Monthly)"
+    filters:
+      unit: ["I15"]
+      nace_r2: ["B-E36"] # Total industry
+      geo: ["LT"]
+
+  jvs_q_nace2:
+    name: "Job vacancy rate (Quarterly)"
+    filters:
+      s_adj: ["SA"]
+      nace_r2: ["A-S"] # Total NACE
+      unit: ["PC_POP"] # Percentage of posts
+      sizeclas: ["TOTAL"]
+      geo: ["LT"]

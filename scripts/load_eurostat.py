@@ -1,5 +1,6 @@
 import json
 import logging
+import yaml
 from datetime import datetime, timezone, date
 from pathlib import Path
 import pandas as pd
@@ -25,36 +26,15 @@ logger = logging.getLogger(__name__)
 DB_URL = "postgresql+psycopg2://nowcast:nowcast@localhost:5432/nowcast_db"
 engine = create_engine(DB_URL, future=True)
 
-# ----------------------------
-# Config: datasets + filters
-# ----------------------------
-DATASETS = {
-    "namq_10_gdp": {  # Quarterly
-        "unit": ["CLV10_MNAC", "CP_MNAC"],
-        "s_adj": ["SCA"],
-        "na_item": ["B1GQ", "P3", "P6", "P7"],
-        "geo": ["LT"],
-        # можно добавить "freq": ["Q"], но в некоторых наборах freq уже зашит
-    },
-    "prc_hicp_midx": {  # Monthly
-        "unit": ["I15"],
-        "coicop": ["CP00"],
-        "geo": ["LT"],
-    },
-    "une_rt_m": {  # Monthly
-        "unit": ["PC_ACT"],
-        "s_adj": ["SA"],
-        "age": ["TOTAL"],
-        "sex": ["T"],
-        "geo": ["LT"],
-    },
-    "sts_inpr_m": {  # Monthly
-        "unit": ["I15"],
-        "s_adj": ["SCA"],
-        "nace_r2": ["B-D"],
-        "geo": ["LT"],
-    },
-}
+CONFIG_PATH = Path(__file__).parent.parent / "config" / "datasets.yaml"
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        logger.error(f"Config file not found at {CONFIG_PATH}")
+        return {}
+    
+    with open(CONFIG_PATH, "r") as f:
+        return yaml.safe_load(f) or {}
 
 # ----------------------------
 # Helpers: DB upserts
@@ -154,18 +134,18 @@ def to_period_date(x) -> date:
 
 def is_time_column(col_name: str) -> bool:
     """
-    Eurostat bulk df обычно имеет time-колонки:
+    Eurostat bulk df dazniausiai turi:
       '2023', '2023Q1', '2023M01', '2023-01'
     """
     s = str(col_name).strip()
     if len(s) >= 4 and s[:4].isdigit():
-        # очень грубая эвристика, но работает для eurostat таблиц
+        #galimai reikes pakeisti, bet kol kas veikia
         return True
     return False
 
 
 def detect_geo(dims: dict) -> str:
-    # разные варианты названий
+    #skirtingi pavadinimu variantai
     for k in ("geo", "geo\\time", "geo\\TIME_PERIOD", "GEO"):
         if k in dims:
             v = dims[k]
@@ -175,11 +155,11 @@ def detect_geo(dims: dict) -> str:
 
 
 def detect_freq(dims: dict, time_period_value) -> str:
-    # если freq есть в dims — используем
+    #if freq is in dims — use it
     if "freq" in dims and pd.notna(dims["freq"]):
         return str(dims["freq"])
 
-    # иначе пытаемся определить по времени
+    #kitu atvieju pagal laika
     tp = str(time_period_value)
     if "Q" in tp:
         return "Q"
@@ -193,8 +173,7 @@ def detect_freq(dims: dict, time_period_value) -> str:
 # ----------------------------
 def fetch_dataset_bulk(dataset_code: str) -> pd.DataFrame:
     """
-    Без deprecated SDMX. Скачиваем bulk-таблицу.
-    Для LT + фильтры по нескольким переменным это обычно норм.
+    Be deprecated SDMX. Siunciam bulk-lentele.
     """
     df = eurostat.get_data_df(dataset_code)
     return df
@@ -226,7 +205,7 @@ def fetch_and_ingest(dataset_code: str, filters: dict):
         logger.warning(f"No rows after filtering for {dataset_code}")
         return
 
-    # Определяем колонки времени
+    #Apibreziam laiko stulpelius
     time_cols = [c for c in df.columns if is_time_column(c)]
     if not time_cols:
         logger.error(f"Could not detect time columns for {dataset_code}. Columns: {list(df.columns)}")
@@ -234,7 +213,7 @@ def fetch_and_ingest(dataset_code: str, filters: dict):
 
     id_vars = [c for c in df.columns if c not in time_cols]
 
-    # Приводим к long
+    #Padarom long formata
     df_melted = df.melt(id_vars=id_vars, value_vars=time_cols, var_name="time_period", value_name="value")
     df_melted = df_melted.dropna(subset=["value"]).copy()
 
@@ -248,7 +227,7 @@ def fetch_and_ingest(dataset_code: str, filters: dict):
     with engine.begin() as conn:
         source_id = ensure_source(conn, "eurostat")
 
-        # Чтобы не апсертить series на каждой строке — кешируем series_id по dims
+        #kesuojam series_id pagal dims
         series_cache: dict[tuple, int] = {}
 
         for _, row in df_melted.iterrows():
@@ -258,13 +237,13 @@ def fetch_and_ingest(dataset_code: str, filters: dict):
             freq = detect_freq(dims, row["time_period"])
             unit = str(dims.get("unit")) if "unit" in dims and pd.notna(dims.get("unit")) else None
 
-            # Серийный ключ: dataset + значения измерений (кроме времени)
-            # Важно: используем фиксированный порядок ключей, чтобы ключ был стабильным
+            #Key: dataset + dims (apart laiko)
+            #Fiksuojam raktus, kad butu tvarka
             dim_keys = sorted(id_vars)
             dim_part = ".".join([f"{k}={dims.get(k)}" for k in dim_keys])
             series_key = f"{dataset_code}.{dim_part}"
 
-            cache_key = (series_key, geo, freq, "LEVEL")  # transform пока LEVEL
+            cache_key = (series_key, geo, freq, "LEVEL")  # transform iki LEVEL
 
             if cache_key not in series_cache:
                 series_name = f"{dataset_code} | " + ", ".join([f"{k}:{dims.get(k)}" for k in dim_keys])
@@ -289,14 +268,14 @@ def fetch_and_ingest(dataset_code: str, filters: dict):
                     )
                     series_cache[cache_key] = sid
                 except Exception as e:
-                    # если апсерт серии упал — логируем и пропускаем все obs этой серии
+                    #jei neveikia - loguojam ir praleidziam visus observationus siuos serijos
                     failed += 1
                     logger.warning(f"Failed ensure_series for {series_key}: {e}")
                     continue
 
             series_id = series_cache[cache_key]
 
-            # period_date
+            #period_date
             try:
                 pdate = to_period_date(row["time_period"])
                 val = float(row["value"])
@@ -305,7 +284,7 @@ def fetch_and_ingest(dataset_code: str, filters: dict):
                 logger.warning(f"Bad row (date/value) dataset={dataset_code} time={row['time_period']}: {e}")
                 continue
 
-            # SAVEPOINT: одна плохая вставка не ломает транзакцию
+            #SAVEPOINT:
             try:
                 with conn.begin_nested():
                     conn.execute(
@@ -321,7 +300,7 @@ def fetch_and_ingest(dataset_code: str, filters: dict):
                 failed += 1
                 logger.warning(f"Insert observation failed: {e}")
 
-        # ingestion_log
+        #ingestion_log
         details = json.dumps(
             {
                 "dataset": dataset_code,
@@ -351,7 +330,17 @@ def fetch_and_ingest(dataset_code: str, filters: dict):
 
 
 def main():
-    for code, filters in DATASETS.items():
+    config = load_config()
+    eurostat_config = config.get("eurostat", {})
+    
+    if not eurostat_config:
+        logger.warning("No 'eurostat' section found in config.")
+        return
+
+    for code, details in eurostat_config.items():
+        # Support both simple list of filters or nested logic
+        # Our yaml structure is: code -> {name: ..., filters: ...}
+        filters = details.get("filters", {})
         fetch_and_ingest(code, filters)
 
 
