@@ -37,6 +37,13 @@ def main():
     except Exception as e:
         logger.error(f"Financials loader failed: {e}")
 
+    try:
+        logger.info("--- Running FRED-MD Loader ---")
+        from scripts import fredmd
+        fredmd.main()
+    except Exception as e:
+        logger.error(f"FRED-MD loader failed: {e}")
+
     elapsed = time.time() - start_time
     logger.info(f"=== Ingestion Complete in {elapsed:.2f} seconds ===")
 

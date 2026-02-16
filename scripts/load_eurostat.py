@@ -1,24 +1,22 @@
+# load_eurostat.py
 import json
 import logging
-import yaml
+import re
+import hashlib
 from datetime import datetime, timezone, date
 from pathlib import Path
+from typing import Any, Dict, Optional
+
 import pandas as pd
+import yaml
 import eurostat
 from sqlalchemy import create_engine, text
-import re
-
-_RE_YQ = re.compile(r"^(\d{4})[- ]?Q([1-4])$")       #2025Q3 arba 2025-Q3 arba 2025 Q3
-_RE_YM = re.compile(r"^(\d{4})[- ]?M(\d{1,2})$")     #2025M01 arba 2025-M01 arba 2025 M1
-_RE_Y_MM = re.compile(r"^(\d{4})-(\d{2})$")          #2025-01
-_RE_Y = re.compile(r"^(\d{4})$")                     #2025
-_RE_YMD = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")   #2025-01-01
 
 # ----------------------------
 # Logging
 # ----------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("eurostat")
 
 # ----------------------------
 # DB
@@ -26,70 +24,153 @@ logger = logging.getLogger(__name__)
 DB_URL = "postgresql+psycopg2://nowcast:nowcast@localhost:5432/nowcast_db"
 engine = create_engine(DB_URL, future=True)
 
-CONFIG_PATH = Path(__file__).parent.parent / "config" / "datasets.yaml"
+# ----------------------------
+# Paths
+# ----------------------------
+RAW_DIR = Path("data/raw/eurostat")
+RAW_DIR.mkdir(parents=True, exist_ok=True)
 
+# Try both: repo config/ and local file next to script
+CONFIG_PATH = Path(__file__).parent.parent / "config" / "datasets.yaml"
+FALLBACK_CONFIG = Path(__file__).with_name("datasets.yaml")
+
+# ----------------------------
+# TIME parsing regex
+# ----------------------------
+_RE_YQ = re.compile(r"^(\d{4})[- ]?Q([1-4])$", re.I)        # 2024Q1 / 2024-Q1
+_RE_YM = re.compile(r"^(\d{4})[- ]?M(\d{1,2})$", re.I)      # 2024M02 / 2024-M2
+_RE_Y_MM = re.compile(r"^(\d{4})-(\d{2})$")                 # 2024-02
+_RE_Y = re.compile(r"^(\d{4})$")                            # 2024
+_RE_YMD = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")          # 2024-02-16
+
+
+# ============================================================
+# Config
+# ============================================================
 def load_config() -> dict:
-    if not CONFIG_PATH.exists():
-        logger.error(f"Config file not found at {CONFIG_PATH}")
+    path = CONFIG_PATH if CONFIG_PATH.exists() else FALLBACK_CONFIG
+    if not path.exists():
+        logger.error(f"Config file not found: {CONFIG_PATH} nor {FALLBACK_CONFIG}")
         return {}
-    
-    with open(CONFIG_PATH, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
-# ----------------------------
-# Helpers: DB upserts
-# ----------------------------
+
+# ============================================================
+# DB Helpers
+# ============================================================
 def ensure_source(conn, name: str) -> int:
-    conn.execute(
-        text("""
-            insert into sources (name) values (:name)
-            on conflict (name) do nothing
-        """),
-        {"name": name},
-    )
-    return conn.execute(text("select id from sources where name=:name"), {"name": name}).scalar_one()
+    conn.execute(text("""
+        INSERT INTO sources (name) VALUES (:name)
+        ON CONFLICT (name) DO NOTHING
+    """), {"name": name})
+    return conn.execute(text("SELECT id FROM sources WHERE name=:name"), {"name": name}).scalar_one()
 
 
-def ensure_series(
-    conn,
-    source_id: int,
-    key: str,
-    country: str,
-    frequency: str,
-    transform: str,
-    unit: str | None,
-    name: str,
-    meta: dict,
-) -> int:
+def ensure_series(conn,
+                  source_id: int,
+                  key: str,
+                  country: str,
+                  frequency: str,
+                  transform: str,
+                  unit: Optional[str],
+                  name: str,
+                  meta: dict) -> int:
     meta_json = json.dumps(meta, ensure_ascii=False)
-    return conn.execute(
-        text("""
-            insert into series (source_id, key, country, frequency, transform, unit, name, meta)
-            values (:sid, :key, :country, :freq, :transform, :unit, :name, CAST(:meta AS jsonb))
-            on conflict (source_id, key, country, frequency, transform)
-            do update set
-                unit = excluded.unit,
-                name = excluded.name,
-                meta = excluded.meta
-            returning id
-        """),
-        {
-            "sid": source_id,
-            "key": key,
-            "country": country,
-            "freq": frequency,
-            "transform": transform,
-            "unit": unit,
-            "name": name,
-            "meta": meta_json,
-        },
-    ).scalar_one()
+    return conn.execute(text("""
+        INSERT INTO series (source_id, key, country, frequency, transform, unit, name, meta)
+        VALUES (:sid, :key, :country, :freq, :transform, :unit, :name, CAST(:meta AS jsonb))
+        ON CONFLICT (source_id, key, country, frequency, transform)
+        DO UPDATE SET
+            unit = EXCLUDED.unit,
+            name = EXCLUDED.name,
+            meta = EXCLUDED.meta
+        RETURNING id
+    """), {
+        "sid": source_id,
+        "key": key,
+        "country": country,
+        "freq": frequency,
+        "transform": transform,
+        "unit": unit,
+        "name": name,
+        "meta": meta_json
+    }).scalar_one()
 
 
-# ----------------------------
-# Helpers: parsing dates
-# ----------------------------
-def to_period_date(x) -> date:
+def create_release(conn,
+                   source_id: int,
+                   downloaded_at: datetime,
+                   vintage_at: datetime,
+                   description: str,
+                   raw_path: Optional[str],
+                   content_hash: Optional[str],
+                   scope: Optional[str] = None,
+                   meta: Optional[dict] = None) -> int:
+    meta = meta or {}
+    if scope:
+        meta["scope"] = scope
+    meta_json = json.dumps(meta, ensure_ascii=False)
+
+    return conn.execute(text("""
+        INSERT INTO releases (source_id, release_time, downloaded_at, vintage_at,
+                              description, raw_path, content_hash, meta)
+        VALUES (:sid, :rtime, :dlat, :vint, :desc, :raw, :hash, CAST(:meta AS jsonb))
+        RETURNING id
+    """), {
+        "sid": source_id,
+        "rtime": downloaded_at,     # keep compatible semantics
+        "dlat": downloaded_at,
+        "vint": vintage_at,
+        "desc": description,
+        "raw": raw_path,
+        "hash": content_hash,
+        "meta": meta_json
+    }).scalar_one()
+
+
+def last_release_hash(conn, source_id: int, scope: Optional[str] = None) -> Optional[str]:
+    if scope:
+        return conn.execute(text("""
+            SELECT content_hash
+            FROM releases
+            WHERE source_id=:sid AND meta->>'scope' = :scope
+            ORDER BY downloaded_at DESC
+            LIMIT 1
+        """), {"sid": source_id, "scope": scope}).scalar_one_or_none()
+
+    return conn.execute(text("""
+        SELECT content_hash
+        FROM releases
+        WHERE source_id=:sid
+        ORDER BY downloaded_at DESC
+        LIMIT 1
+    """), {"sid": source_id}).scalar_one_or_none()
+
+
+# ============================================================
+# File helpers
+# ============================================================
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ============================================================
+# Time helpers
+# ============================================================
+def to_period_date(x: Any) -> date:
+    """
+    Eurostat time columns often look like:
+      '2024M02', '2024Q1', '2024-02', '2024'
+    Convert them into a date for period alignment:
+      M -> first day of month
+      Q -> first month of quarter
+      Y -> Jan 1st
+    """
     if isinstance(x, (pd.Timestamp, datetime)):
         return x.date()
 
@@ -97,13 +178,11 @@ def to_period_date(x) -> date:
     if not s or s.lower() == "nan":
         raise ValueError("Empty TIME_PERIOD")
 
-    # YYYY-MM-DD
     m = _RE_YMD.match(s)
     if m:
         y, mo, d = map(int, m.groups())
         return date(y, mo, d)
 
-    # YYYY-Qn / YYYYQn / YYYY Qn
     m = _RE_YQ.match(s)
     if m:
         y = int(m.group(1))
@@ -111,147 +190,195 @@ def to_period_date(x) -> date:
         month = (q - 1) * 3 + 1
         return date(y, month, 1)
 
-    # YYYY-Mmm / YYYYMmm / YYYY Mmm
     m = _RE_YM.match(s)
     if m:
         y = int(m.group(1))
         mo = int(m.group(2))
         return date(y, mo, 1)
 
-    # YYYY-MM
     m = _RE_Y_MM.match(s)
     if m:
         y, mo = map(int, m.groups())
         return date(y, mo, 1)
 
-    # YYYY
     m = _RE_Y.match(s)
     if m:
         return date(int(m.group(1)), 1, 1)
 
-    raise ValueError(f"Unsupported TIME_PERIOD: {x!r}")
+    raise ValueError(f"Unsupported time label: {x!r}")
 
 
-def is_time_column(col_name: str) -> bool:
+def detect_time_columns(df: pd.DataFrame) -> list[str]:
     """
-    Eurostat bulk df dazniausiai turi:
-      '2023', '2023Q1', '2023M01', '2023-01'
+    eurostat.get_data_df returns wide format:
+      dimension columns + time columns like 2024M01, 2024Q1, 2024 etc.
+    Detect time columns heuristically.
     """
-    s = str(col_name).strip()
-    if len(s) >= 4 and s[:4].isdigit():
-        #galimai reikes pakeisti, bet kol kas veikia
-        return True
-    return False
+    time_cols = []
+    for c in df.columns:
+        cs = str(c)
+        if len(cs) >= 4 and cs[:4].isdigit():
+            time_cols.append(c)
+    return time_cols
 
 
-def detect_geo(dims: dict) -> str:
-    #skirtingi pavadinimu variantai
-    for k in ("geo", "geo\\time", "geo\\TIME_PERIOD", "GEO"):
-        if k in dims:
-            v = dims[k]
-            if pd.notna(v):
-                return str(v)
-    return "UNKNOWN"
+def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    """
+    filters:
+      {"geo": ["LT"], "unit": ["CP_MEUR"], ...}
+    """
+    if not filters:
+        return df
+    out = df
+    for col, allowed in filters.items():
+        if col in out.columns:
+            out = out[out[col].isin(allowed)]
+    return out
 
 
-def detect_freq(dims: dict, time_period_value) -> str:
-    #if freq is in dims — use it
-    if "freq" in dims and pd.notna(dims["freq"]):
+def normalize_dim_value(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    if isinstance(v, float) and pd.isna(v):
+        return None
+    s = str(v)
+    return s
+
+
+def build_series_key(dataset_code: str, dims: Dict[str, Any], dim_cols: list[str]) -> str:
+    parts = [f"{k}={normalize_dim_value(dims.get(k))}" for k in dim_cols]
+    return f"{dataset_code}." + ".".join(parts)
+
+
+def guess_country(dims: Dict[str, Any]) -> str:
+    # Common Eurostat geo column
+    for k in ("geo", "GEO"):
+        if k in dims and dims[k] is not None:
+            return str(dims[k])
+    return "EU"
+
+
+def guess_frequency(dims: Dict[str, Any], time_label: Any) -> str:
+    if "freq" in dims and dims["freq"] is not None:
         return str(dims["freq"])
-
-    #kitu atvieju pagal laika
-    tp = str(time_period_value)
-    if "Q" in tp:
+    s = str(time_label)
+    if "Q" in s:
         return "Q"
-    if "M" in tp or "-" in tp:
+    if "M" in s or "-" in s:
         return "M"
     return "A"
 
 
-# ----------------------------
-# Fetch + ingest
-# ----------------------------
-def fetch_dataset_bulk(dataset_code: str) -> pd.DataFrame:
+# ============================================================
+# Core ingestion
+# ============================================================
+def fetch_dataset(dataset_code: str) -> pd.DataFrame:
+    # eurostat package
+    return eurostat.get_data_df(dataset_code)
+
+
+def ingest_dataset(dataset_code: str, dataset_cfg: dict, mode: str = "initial"):
     """
-    Be deprecated SDMX. Siunciam bulk-lentele.
+    dataset_cfg example:
+      {"filters": {"geo": ["LT"], "unit": ["CP_MEUR"]}, "name": "..."}
     """
-    df = eurostat.get_data_df(dataset_code)
-    return df
+    filters = dataset_cfg.get("filters", {}) if isinstance(dataset_cfg, dict) else {}
+    dataset_name = dataset_cfg.get("name", dataset_code) if isinstance(dataset_cfg, dict) else dataset_code
 
+    downloaded_at = datetime.now(timezone.utc)
+    vintage_at = downloaded_at  # Eurostat snapshot-vintage
+    stamp = downloaded_at.strftime("%Y-%m-%dT%H%M%SZ")
 
-def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
-    for col, allowed in filters.items():
-        if col in df.columns:
-            df = df[df[col].isin(allowed)]
-    return df
+    logger.info(f"[{mode}] Eurostat dataset={dataset_code} filters={filters}")
 
-
-def fetch_and_ingest(dataset_code: str, filters: dict):
-    logger.info(f"Fetching {dataset_code} (bulk) with filters {filters}...")
-
+    # 1) Fetch
     try:
-        df = fetch_dataset_bulk(dataset_code)
+        df = fetch_dataset(dataset_code)
     except Exception as e:
-        logger.exception(f"Failed to fetch bulk dataset {dataset_code}: {e}")
+        logger.error(f"Fetch failed for {dataset_code}: {e}")
         return
 
     if df is None or df.empty:
-        logger.warning(f"No data (empty) for {dataset_code}")
+        logger.warning(f"{dataset_code}: empty dataset")
         return
 
+    # 2) Filter
     df = apply_filters(df, filters)
-
     if df.empty:
-        logger.warning(f"No rows after filtering for {dataset_code}")
+        logger.warning(f"{dataset_code}: empty after filtering")
         return
 
-    #Apibreziam laiko stulpelius
-    time_cols = [c for c in df.columns if is_time_column(c)]
-    if not time_cols:
-        logger.error(f"Could not detect time columns for {dataset_code}. Columns: {list(df.columns)}")
-        return
+    # 3) Save raw snapshot
+    raw_path = RAW_DIR / f"{dataset_code}_{stamp}.csv"
+    df.to_csv(raw_path, index=False)
+    content_hash = sha256_file(raw_path)
 
-    id_vars = [c for c in df.columns if c not in time_cols]
-
-    #Padarom long formata
-    df_melted = df.melt(id_vars=id_vars, value_vars=time_cols, var_name="time_period", value_name="value")
-    df_melted = df_melted.dropna(subset=["value"]).copy()
-
-    logger.info(f"Filtered rows (id rows): {len(df)}; observations (after melt, non-null): {len(df_melted)}")
-
-    observed_at = datetime.now(timezone.utc).isoformat()
-
-    inserted = 0
-    failed = 0
+    # 4) Scope for hash-based update skipping
+    scope = f"dataset:{dataset_code}|filters:{json.dumps(filters, sort_keys=True)}"
 
     with engine.begin() as conn:
         source_id = ensure_source(conn, "eurostat")
 
-        #kesuojam series_id pagal dims
+        if mode == "update":
+            prev_hash = last_release_hash(conn, source_id, scope=scope)
+            if prev_hash == content_hash:
+                logger.info(f"{dataset_code}: no changes (hash same) -> skip")
+                return
+
+        # 5) Create release
+        release_id = create_release(
+            conn=conn,
+            source_id=source_id,
+            downloaded_at=downloaded_at,
+            vintage_at=vintage_at,
+            description=f"Eurostat snapshot {dataset_code}",
+            raw_path=str(raw_path),
+            content_hash=content_hash,
+            scope=scope,
+            meta={"dataset_code": dataset_code, "dataset_name": dataset_name, "filters": filters, "mode": mode}
+        )
+
+        # 6) Detect time columns and melt
+        time_cols = detect_time_columns(df)
+        if not time_cols:
+            raise RuntimeError(f"{dataset_code}: cannot detect time columns. Columns={list(df.columns)}")
+
+        dim_cols = [c for c in df.columns if c not in time_cols]
+
+        df_long = df.melt(
+            id_vars=dim_cols,
+            value_vars=time_cols,
+            var_name="time_label",
+            value_name="value"
+        ).dropna(subset=["value"]).copy()
+
+        inserted = 0
+        failed = 0
+
+        # 7) Cache series ids to avoid repeated ensure_series calls
         series_cache: dict[tuple, int] = {}
 
-        for _, row in df_melted.iterrows():
-            dims = {k: row[k] for k in id_vars}
+        for _, row in df_long.iterrows():
+            dims = {c: normalize_dim_value(row[c]) for c in dim_cols}
 
-            geo = detect_geo(dims)
-            freq = detect_freq(dims, row["time_period"])
-            unit = str(dims.get("unit")) if "unit" in dims and pd.notna(dims.get("unit")) else None
+            # Determine basic properties
+            country = guess_country(dims)
+            freq = guess_frequency(dims, row["time_label"])
+            unit = normalize_dim_value(dims.get("unit"))
 
-            #Key: dataset + dims (apart laiko)
-            #Fiksuojam raktus, kad butu tvarka
-            dim_keys = sorted(id_vars)
-            dim_part = ".".join([f"{k}={dims.get(k)}" for k in dim_keys])
-            series_key = f"{dataset_code}.{dim_part}"
-
-            cache_key = (series_key, geo, freq, "LEVEL")  # transform iki LEVEL
+            # Build key + name
+            series_key = build_series_key(dataset_code, dims, dim_cols)
+            cache_key = (series_key, country, freq, "LEVEL")
 
             if cache_key not in series_cache:
-                series_name = f"{dataset_code} | " + ", ".join([f"{k}:{dims.get(k)}" for k in dim_keys])
+                pretty_dims = ", ".join([f"{c}:{dims.get(c)}" for c in dim_cols])
+                series_name = f"{dataset_name} ({dataset_code}) | {pretty_dims}"
 
-                series_meta = {
+                meta = {
                     "dataset_code": dataset_code,
-                    "dimensions": {k: (None if pd.isna(dims.get(k)) else str(dims.get(k))) for k in dim_keys},
-                    "filters": filters,
+                    "dataset_name": dataset_name,
+                    "dimensions": dims,
+                    "filters": filters
                 }
 
                 try:
@@ -259,90 +386,91 @@ def fetch_and_ingest(dataset_code: str, filters: dict):
                         conn=conn,
                         source_id=source_id,
                         key=series_key,
-                        country=geo,
+                        country=country,
                         frequency=freq,
                         transform="LEVEL",
                         unit=unit,
                         name=series_name,
-                        meta=series_meta,
+                        meta=meta
                     )
                     series_cache[cache_key] = sid
                 except Exception as e:
-                    #jei neveikia - loguojam ir praleidziam visus observationus siuos serijos
                     failed += 1
-                    logger.warning(f"Failed ensure_series for {series_key}: {e}")
+                    logger.warning(f"ensure_series failed for {series_key}: {e}")
                     continue
 
             series_id = series_cache[cache_key]
 
-            #period_date
+            # Parse time -> period_date
             try:
-                pdate = to_period_date(row["time_period"])
+                pdate = to_period_date(row["time_label"])
                 val = float(row["value"])
             except Exception as e:
                 failed += 1
-                logger.warning(f"Bad row (date/value) dataset={dataset_code} time={row['time_period']}: {e}")
+                logger.warning(f"Bad row time={row['time_label']}: {e}")
                 continue
 
-            #SAVEPOINT:
+            # 8) Insert observation
             try:
-                with conn.begin_nested():
-                    conn.execute(
-                        text("""
-                            insert into observations (series_id, period_date, observed_at, value, status, meta)
-                            values (:sid, :pdate, :oat, :val, null, '{}'::jsonb)
-                            on conflict (series_id, period_date, observed_at) do nothing
-                        """),
-                        {"sid": series_id, "pdate": pdate, "oat": observed_at, "val": val},
-                    )
-                    inserted += 1
+                conn.execute(text("""
+                    INSERT INTO observations (series_id, period_date, observed_at, value, release_id, meta)
+                    VALUES (:sid, :pdate, :oat, :val, :rid, '{}'::jsonb)
+                    ON CONFLICT (series_id, period_date, observed_at) DO NOTHING
+                """), {
+                    "sid": series_id,
+                    "pdate": pdate,
+                    "oat": vintage_at,
+                    "val": val,
+                    "rid": release_id
+                })
+                inserted += 1
             except Exception as e:
                 failed += 1
-                logger.warning(f"Insert observation failed: {e}")
+                logger.warning(f"Insert failed: {e}")
 
-        #ingestion_log
-        details = json.dumps(
-            {
-                "dataset": dataset_code,
-                "observed_at": observed_at,
-                "rows_id": int(len(df)),
-                "rows_obs": int(len(df_melted)),
-                "series_created_or_seen": len(series_cache),
-            },
-            ensure_ascii=False,
-        )
+        # 9) Ingestion log
+        details = {
+            "dataset_code": dataset_code,
+            "filters": filters,
+            "mode": mode,
+            "downloaded_at": downloaded_at.isoformat(),
+            "vintage_at": vintage_at.isoformat(),
+            "raw_path": str(raw_path),
+            "hash": content_hash,
+            "dim_cols": dim_cols,
+            "time_cols_count": len(time_cols),
+            "series_count": len(series_cache),
+            "rows_long": int(len(df_long))
+        }
 
-        conn.execute(
-            text("""
-                insert into ingestion_log (source_id, status, rows_inserted, rows_failed, details)
-                values (:source_id, :status, :ins, :fail, CAST(:details AS jsonb))
-            """),
-            {
-                "source_id": source_id,
-                "status": "ok" if failed == 0 else "ok_with_errors",
-                "ins": inserted,
-                "fail": failed,
-                "details": details,
-            },
-        )
+        conn.execute(text("""
+            INSERT INTO ingestion_log (source_id, status, rows_inserted, rows_failed, details)
+            VALUES (:source_id, :status, :ins, :fail, CAST(:details AS jsonb))
+        """), {
+            "source_id": source_id,
+            "status": "ok" if failed == 0 else "ok_with_errors",
+            "ins": inserted,
+            "fail": failed,
+            "details": json.dumps(details, ensure_ascii=False)
+        })
 
-    logger.info(f"Done {dataset_code}: inserted={inserted}, failed={failed}")
+    logger.info(f"{dataset_code}: inserted={inserted}, failed={failed}, series={len(series_cache)}")
 
 
-def main():
+# ============================================================
+# Entry point
+# ============================================================
+def main(mode: str = "initial"):
     config = load_config()
-    eurostat_config = config.get("eurostat", {})
-    
-    if not eurostat_config:
-        logger.warning("No 'eurostat' section found in config.")
+    euro_cfg = config.get("eurostat", {}) if isinstance(config, dict) else {}
+
+    if not euro_cfg:
+        logger.warning("No 'eurostat' section in config.")
         return
 
-    for code, details in eurostat_config.items():
-        # Support both simple list of filters or nested logic
-        # Our yaml structure is: code -> {name: ..., filters: ...}
-        filters = details.get("filters", {})
-        fetch_and_ingest(code, filters)
+    for dataset_code, dataset_cfg in euro_cfg.items():
+        ingest_dataset(dataset_code, dataset_cfg or {}, mode=mode)
 
 
 if __name__ == "__main__":
-    main()
+    main(mode="initial")

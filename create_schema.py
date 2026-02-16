@@ -4,80 +4,88 @@ DB_URL = "postgresql+psycopg2://nowcast:nowcast@localhost:5432/nowcast_db"
 engine = create_engine(DB_URL, future=True)
 
 DDL = """
-create table if not exists sources (
-  id bigserial primary key,
-  name text not null unique,
-  base_url text, 
-  meta jsonb not null default '{}'::jsonb
+-- Clean drop (order matters with FKs, CASCADE simplifies)
+DROP TABLE IF EXISTS ingestion_log CASCADE;
+DROP TABLE IF EXISTS observations CASCADE;
+DROP TABLE IF EXISTS releases CASCADE;
+DROP TABLE IF EXISTS series CASCADE;
+DROP TABLE IF EXISTS sources CASCADE;
+
+CREATE TABLE sources (
+  id          BIGSERIAL PRIMARY KEY,
+  name        TEXT NOT NULL UNIQUE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-create table if not exists series (
-  id bigserial primary key,
-  source_id bigint not null references sources(id),
-  key text not null,
-  country text,
-  frequency text not null,
-  transform text not null default 'LEVEL',
-  unit text,
-  name text,
-  meta jsonb not null default '{}'::jsonb,
-  created_at timestamptz not null default now(),
-  unique (source_id, key, country, frequency, transform)
+CREATE TABLE series (
+  id          BIGSERIAL PRIMARY KEY,
+  source_id   BIGINT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  key         TEXT NOT NULL,
+  country     TEXT NOT NULL,
+  frequency   TEXT NOT NULL,       -- e.g. 'D','W','M','Q','A'
+  transform   TEXT NOT NULL,       -- e.g. 'LEVEL','LOG','DIFF' etc (your label)
+  unit        TEXT,
+  name        TEXT,
+  meta        JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  UNIQUE (source_id, key, country, frequency, transform)
 );
 
-create index if not exists idx_series_lookup
-  on series (key, country, frequency, transform);
+-- releases = what you ingested (downloaded_at) and what "as-of" snapshot/vintage it represents (vintage_at)
+CREATE TABLE releases (
+  id            BIGSERIAL PRIMARY KEY,
+  source_id     BIGINT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
 
-create table if not exists observations (
-  series_id bigint not null references series(id),
-  period_date date not null,
-  observed_at timestamptz not null,
-  value double precision,
-  status text,
-  meta jsonb not null default '{}'::jsonb,
-  primary key (series_id, period_date, observed_at)
+  -- keep release_time for backward compatibility; set equal to downloaded_at if you want
+  release_time  TIMESTAMPTZ NOT NULL,
+
+  downloaded_at TIMESTAMPTZ NOT NULL,   -- when your code downloaded/ingested it
+  vintage_at    TIMESTAMPTZ NOT NULL,   -- as-of time (vintage). For ALFRED = real vintage date. For others = snapshot time.
+
+  description   TEXT,
+  raw_path      TEXT,                  -- path to raw file you saved (optional)
+  content_hash  TEXT,                  -- sha256 of raw file (optional)
+  meta          JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-create index if not exists idx_obs_series_period
-  on observations (series_id, period_date);
+CREATE TABLE observations (
+  id          BIGSERIAL PRIMARY KEY,
+  series_id   BIGINT NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+  period_date DATE NOT NULL,              -- period the value refers to
+  observed_at TIMESTAMPTZ NOT NULL,       -- vintage/as-of time
+  value       DOUBLE PRECISION NOT NULL,
+  status      TEXT,
+  release_id  BIGINT REFERENCES releases(id) ON DELETE SET NULL,
+  meta        JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-create index if not exists idx_obs_observed_at
-  on observations (observed_at);
-
-create table if not exists ingestion_log (
-  id bigserial primary key,
-  source_id bigint references sources(id),
-  run_at timestamptz not null default now(),
-  status text not null,
-  rows_inserted bigint not null default 0,
-  rows_failed bigint not null default 0,
-  details jsonb not null default '{}'::jsonb
+  UNIQUE (series_id, period_date, observed_at)
 );
 
-create table if not exists indicators (
-  id bigserial primary key,
-  code text not null unique,   -- GDP, CPI, UNEMP
-  name text,
-  description text,
-  created_at timestamptz default now()
+CREATE TABLE ingestion_log (
+  id            BIGSERIAL PRIMARY KEY,
+  source_id     BIGINT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  run_time      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  status        TEXT NOT NULL,
+  rows_inserted INTEGER NOT NULL DEFAULT 0,
+  rows_failed   INTEGER NOT NULL DEFAULT 0,
+  details       JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
-create table if not exists releases (
-  id bigserial primary key,
-  source_id bigint references sources(id),
-  release_time timestamptz not null,
-  description text,
-  meta jsonb default '{}'::jsonb
-);
-
-alter table series
-add column if not exists indicator_id bigint references indicators(id);
-
-alter table observations
-add column if not exists release_id bigint references releases(id);
+-- Useful indexes
+CREATE INDEX ix_series_source_id ON series(source_id);
+CREATE INDEX ix_observations_series_period ON observations(series_id, period_date);
+CREATE INDEX ix_observations_series_vintage ON observations(series_id, observed_at);
+CREATE INDEX ix_releases_source_vintage ON releases(source_id, vintage_at);
 """
 
-with engine.begin() as conn:
-    conn.execute(text(DDL))
+def main():
+    with engine.begin() as conn:
+        conn.execute(text(DDL))
+    print("Schema created")
 
-print("Schema created")
+if __name__ == "__main__":
+    main()
