@@ -71,7 +71,7 @@ def parse_fredmd(csv_path: Path) -> tuple[pd.DataFrame, dict]:
     """
     df = pd.read_csv(csv_path)
 
-    #Dazniausiai pirmas stulpialis yra sasdate
+    #Dazniausiai pirmas stulpelis yra sasdate
     #Kartais FRED-MD turi eiluciu su tcodes.
     #Jei pirmas stulpelis yra 'transform'/'tcode' — tai kodu eilute.
     first_col = df.columns[0]

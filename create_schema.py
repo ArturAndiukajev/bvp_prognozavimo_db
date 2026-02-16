@@ -7,7 +7,7 @@ DDL = """
 create table if not exists sources (
   id bigserial primary key,
   name text not null unique,
-  base_url text,
+  base_url text, 
   meta jsonb not null default '{}'::jsonb
 );
 
