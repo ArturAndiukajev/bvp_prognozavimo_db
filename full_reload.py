@@ -26,3 +26,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#namq_10_pc ilgai 7 min, namq_10_gdp 5 min, nama_10_a10_e 7 min, lfsi_long_q daugiau nei 20 min

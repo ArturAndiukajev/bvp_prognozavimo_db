@@ -5,12 +5,14 @@ import re
 import hashlib
 from datetime import datetime, timezone, date
 from pathlib import Path
-from typing import Any, Dict, Optional
-
+from typing import Any, Dict, Optional, Iterable, Tuple
+import time
 import pandas as pd
 import yaml
 import eurostat
 from sqlalchemy import create_engine, text
+from io import StringIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ----------------------------
 # Logging
@@ -22,7 +24,12 @@ logger = logging.getLogger("eurostat")
 # DB
 # ----------------------------
 DB_URL = "postgresql+psycopg2://nowcast:nowcast@localhost:5432/nowcast_db"
-engine = create_engine(DB_URL, future=True)
+engine = create_engine(
+    DB_URL,
+    future=True,
+    #nedidelis boostas
+    pool_pre_ping=True,
+)
 
 # ----------------------------
 # Paths
@@ -55,6 +62,21 @@ def load_config() -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
+# ============================================================
+# Timer helper
+# ============================================================
+class Timer:
+    def __init__(self, label: str):
+        self.label = label
+        self.t0: float | None = None
+
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        dt = time.perf_counter() - (self.t0 or time.perf_counter())
+        logger.info(f"[TIMER] {self.label}: {dt:.2f}s")
 
 # ============================================================
 # DB Helpers
@@ -270,10 +292,71 @@ def guess_frequency(dims: Dict[str, Any], time_label: Any) -> str:
 
 
 # ============================================================
+# COPY helpers (staging temp table)
+# ============================================================
+def _get_psycopg2_connection(sa_conn):
+    """
+    SQLAlchemy Connection -> raw psycopg2 connection.
+    Works with SQLAlchemy 1.4/2.0 + psycopg2.
+    """
+    # SQLAlchemy 2.0: sa_conn.connection is ConnectionFairy, .connection is DBAPI conn
+    raw = getattr(sa_conn, "connection", None)
+    if raw is None:
+        raise RuntimeError("Cannot access raw DBAPI connection")
+
+    # some envs: raw has .connection, some: it's already the DBAPI connection
+    dbapi = getattr(raw, "connection", None) or getattr(raw, "driver_connection", None) or raw
+    return dbapi
+
+
+def copy_to_staging_and_merge(conn, rows: Iterable[Tuple[int, date, datetime, float, int]]):
+    """
+    rows: (series_id, period_date, observed_at, value, release_id)
+    Uses TEMP staging table + COPY, then merges into observations with ON CONFLICT DO NOTHING.
+    """
+    conn.execute(text("""
+        CREATE TEMP TABLE IF NOT EXISTS observations_staging (
+            series_id   BIGINT,
+            period_date DATE,
+            observed_at TIMESTAMPTZ,
+            value       DOUBLE PRECISION,
+            release_id  BIGINT
+        ) ON COMMIT DROP
+    """))
+
+    # Truncate staging (in case temp table exists in same session)
+    conn.execute(text("TRUNCATE TABLE observations_staging"))
+
+    buf = StringIO()
+    # CSV without header; fastest format for COPY
+    # ensure ISO strings (COPY can parse date/timestamptz from ISO)
+    for sid, pdate, oat, val, rid in rows:
+        buf.write(f"{sid},{pdate.isoformat()},{oat.isoformat()},{val},{rid}\n")
+    buf.seek(0)
+
+    dbapi_conn = _get_psycopg2_connection(conn)
+    cur = dbapi_conn.cursor()
+    cur.copy_expert(
+        """
+        COPY observations_staging (series_id, period_date, observed_at, value, release_id)
+        FROM STDIN WITH (FORMAT csv)
+        """,
+        buf
+    )
+
+    # merge into main table
+    conn.execute(text("""
+        INSERT INTO observations (series_id, period_date, observed_at, value, release_id, meta)
+        SELECT series_id, period_date, observed_at, value, release_id, '{}'::jsonb
+        FROM observations_staging
+        ON CONFLICT (series_id, period_date, observed_at) DO NOTHING
+    """))
+
+
+# ============================================================
 # Core ingestion
 # ============================================================
 def fetch_dataset(dataset_code: str) -> pd.DataFrame:
-    # eurostat package
     return eurostat.get_data_df(dataset_code)
 
 
@@ -292,53 +375,33 @@ def ingest_dataset(dataset_code: str, dataset_cfg: dict, mode: str = "initial"):
     logger.info(f"[{mode}] Eurostat dataset={dataset_code} filters={filters}")
 
     # 1) Fetch
-    try:
-        df = fetch_dataset(dataset_code)
-    except Exception as e:
-        logger.error(f"Fetch failed for {dataset_code}: {e}")
-        return
+    with Timer(f"Eurostat fetch {dataset_code}"):
+        try:
+            df = fetch_dataset(dataset_code)
+        except Exception as e:
+            logger.error(f"Fetch failed for {dataset_code}: {e}")
+            return
 
     if df is None or df.empty:
         logger.warning(f"{dataset_code}: empty dataset")
         return
 
-    # 2) Filter
-    df = apply_filters(df, filters)
-    if df.empty:
-        logger.warning(f"{dataset_code}: empty after filtering")
-        return
+    # 2) Filter + save raw + hash
+    with Timer(f"Eurostat filter+save {dataset_code}"):
+        df = apply_filters(df, filters)
+        if df.empty:
+            logger.warning(f"{dataset_code}: empty after filtering")
+            return
 
-    # 3) Save raw snapshot
-    raw_path = RAW_DIR / f"{dataset_code}_{stamp}.csv"
-    df.to_csv(raw_path, index=False)
-    content_hash = sha256_file(raw_path)
+        raw_path = RAW_DIR / f"{dataset_code}_{stamp}.csv"
+        df.to_csv(raw_path, index=False)
+        content_hash = sha256_file(raw_path)
 
-    # 4) Scope for hash-based update skipping
+    # 3) Scope for hash-based update skipping
     scope = f"dataset:{dataset_code}|filters:{json.dumps(filters, sort_keys=True)}"
 
-    with engine.begin() as conn:
-        source_id = ensure_source(conn, "eurostat")
-
-        if mode == "update":
-            prev_hash = last_release_hash(conn, source_id, scope=scope)
-            if prev_hash == content_hash:
-                logger.info(f"{dataset_code}: no changes (hash same) -> skip")
-                return
-
-        # 5) Create release
-        release_id = create_release(
-            conn=conn,
-            source_id=source_id,
-            downloaded_at=downloaded_at,
-            vintage_at=vintage_at,
-            description=f"Eurostat snapshot {dataset_code}",
-            raw_path=str(raw_path),
-            content_hash=content_hash,
-            scope=scope,
-            meta={"dataset_code": dataset_code, "dataset_name": dataset_name, "filters": filters, "mode": mode}
-        )
-
-        # 6) Detect time columns and melt
+    # 4) Transform wide -> long (melt)
+    with Timer(f"Eurostat melt {dataset_code}"):
         time_cols = detect_time_columns(df)
         if not time_cols:
             raise RuntimeError(f"{dataset_code}: cannot detect time columns. Columns={list(df.columns)}")
@@ -352,83 +415,107 @@ def ingest_dataset(dataset_code: str, dataset_cfg: dict, mode: str = "initial"):
             value_name="value"
         ).dropna(subset=["value"]).copy()
 
-        inserted = 0
-        failed = 0
+    failed = 0
+    series_created = 0
+    rows_prepared = 0
+    inserted_attempted = 0
 
-        # 7) Cache series ids to avoid repeated ensure_series calls
+    dim_n = len(dim_cols)
+
+    with engine.begin() as conn:
+        source_id = ensure_source(conn, "eurostat")
+
+        # update-skip
+        if mode == "update":
+            prev_hash = last_release_hash(conn, source_id, scope=scope)
+            if prev_hash == content_hash:
+                logger.info(f"{dataset_code}: no changes (hash same) -> skip")
+                return
+
+        # release
+        release_id = create_release(
+            conn=conn,
+            source_id=source_id,
+            downloaded_at=downloaded_at,
+            vintage_at=vintage_at,
+            description=f"Eurostat snapshot {dataset_code}",
+            raw_path=str(raw_path),
+            content_hash=content_hash,
+            scope=scope,
+            meta={"dataset_code": dataset_code, "dataset_name": dataset_name, "filters": filters, "mode": mode}
+        )
+
+        # Cache series ids
         series_cache: dict[tuple, int] = {}
 
-        for _, row in df_long.iterrows():
-            dims = {c: normalize_dim_value(row[c]) for c in dim_cols}
+        # Prepare COPY batches
+        COPY_BATCH = 200_000  #jei yra RAM, galima didint
+        copy_rows: list[Tuple[int, date, datetime, float, int]] = []
 
-            # Determine basic properties
-            country = guess_country(dims)
-            freq = guess_frequency(dims, row["time_label"])
-            unit = normalize_dim_value(dims.get("unit"))
+        def flush_copy_rows():
+            nonlocal inserted_attempted, copy_rows
+            if not copy_rows:
+                return
+            copy_to_staging_and_merge(conn, copy_rows)
+            inserted_attempted += len(copy_rows)
+            copy_rows = []
 
-            # Build key + name
-            series_key = build_series_key(dataset_code, dims, dim_cols)
-            cache_key = (series_key, country, freq, "LEVEL")
+        with Timer(f"Eurostat prepare+COPY {dataset_code}"):
+            #itertuples greiciau veikia nei iterrows
+            #index=False kad netempt indeksa
+            for t in df_long.itertuples(index=False, name=None):
+                # t: (dim0, dim1, ..., time_label, value)
+                dims = {dim_cols[i]: normalize_dim_value(t[i]) for i in range(dim_n)}
+                time_label = t[dim_n]
+                value = t[dim_n + 1]
 
-            if cache_key not in series_cache:
-                pretty_dims = ", ".join([f"{c}:{dims.get(c)}" for c in dim_cols])
-                series_name = f"{dataset_name} ({dataset_code}) | {pretty_dims}"
+                country = guess_country(dims)
+                freq = guess_frequency(dims, time_label)
+                unit = normalize_dim_value(dims.get("unit"))
 
-                meta = {
-                    "dataset_code": dataset_code,
-                    "dataset_name": dataset_name,
-                    "dimensions": dims,
-                    "filters": filters
-                }
+                series_key = build_series_key(dataset_code, dims, dim_cols)
+                cache_key = (series_key, country, freq, "LEVEL")
+
+                if cache_key not in series_cache:
+                    pretty_dims = ", ".join([f"{c}:{dims.get(c)}" for c in dim_cols])
+                    series_name = f"{dataset_name} ({dataset_code}) | {pretty_dims}"
+                    meta = {"dataset_code": dataset_code, "dataset_name": dataset_name, "dimensions": dims,
+                            "filters": filters}
+
+                    try:
+                        sid = ensure_series(
+                            conn=conn,
+                            source_id=source_id,
+                            key=series_key,
+                            country=country,
+                            frequency=freq,
+                            transform="LEVEL",
+                            unit=unit,
+                            name=series_name,
+                            meta=meta
+                        )
+                        series_cache[cache_key] = sid
+                        series_created += 1
+                    except Exception:
+                        failed += 1
+                        continue
+
+                series_id = series_cache[cache_key]
 
                 try:
-                    sid = ensure_series(
-                        conn=conn,
-                        source_id=source_id,
-                        key=series_key,
-                        country=country,
-                        frequency=freq,
-                        transform="LEVEL",
-                        unit=unit,
-                        name=series_name,
-                        meta=meta
-                    )
-                    series_cache[cache_key] = sid
-                except Exception as e:
+                    pdate = to_period_date(time_label)
+                    val = float(value)
+                except Exception:
                     failed += 1
-                    logger.warning(f"ensure_series failed for {series_key}: {e}")
                     continue
 
-            series_id = series_cache[cache_key]
+                copy_rows.append((series_id, pdate, vintage_at, val, release_id))
+                if len(copy_rows) >= COPY_BATCH:
+                    flush_copy_rows()
 
-            # Parse time -> period_date
-            try:
-                pdate = to_period_date(row["time_label"])
-                val = float(row["value"])
-            except Exception as e:
-                failed += 1
-                logger.warning(f"Bad row time={row['time_label']}: {e}")
-                continue
+            flush_copy_rows()
 
-            # 8) Insert observation
-            try:
-                conn.execute(text("""
-                    INSERT INTO observations (series_id, period_date, observed_at, value, release_id, meta)
-                    VALUES (:sid, :pdate, :oat, :val, :rid, '{}'::jsonb)
-                    ON CONFLICT (series_id, period_date, observed_at) DO NOTHING
-                """), {
-                    "sid": series_id,
-                    "pdate": pdate,
-                    "oat": vintage_at,
-                    "val": val,
-                    "rid": release_id
-                })
-                inserted += 1
-            except Exception as e:
-                failed += 1
-                logger.warning(f"Insert failed: {e}")
-
-        # 9) Ingestion log
+        # ingestion log
         details = {
             "dataset_code": dataset_code,
             "filters": filters,
@@ -439,8 +526,11 @@ def ingest_dataset(dataset_code: str, dataset_cfg: dict, mode: str = "initial"):
             "hash": content_hash,
             "dim_cols": dim_cols,
             "time_cols_count": len(time_cols),
-            "series_count": len(series_cache),
-            "rows_long": int(len(df_long))
+            "series_created": int(series_created),
+            "series_cache_size": int(len(series_cache)),
+            "rows_long": int(len(df_long)),
+            "rows_prepared": int(rows_prepared),
+            "insert_attempted": int(inserted_attempted),
         }
 
         conn.execute(text("""
@@ -449,18 +539,25 @@ def ingest_dataset(dataset_code: str, dataset_cfg: dict, mode: str = "initial"):
         """), {
             "source_id": source_id,
             "status": "ok" if failed == 0 else "ok_with_errors",
-            "ins": inserted,
-            "fail": failed,
+            "ins": int(inserted_attempted),
+            "fail": int(failed),
             "details": json.dumps(details, ensure_ascii=False)
         })
 
-    logger.info(f"{dataset_code}: inserted={inserted}, failed={failed}, series={len(series_cache)}")
+    logger.info(
+        f"{dataset_code}: attempted={inserted_attempted}, failed={failed}, "
+        f"series={len(series_cache)} created={series_created}"
+    )
 
 
 # ============================================================
-# Entry point
+# Entry point (parallel per dataset)
 # ============================================================
-def main(mode: str = "initial"):
+def main(mode: str = "initial", max_workers: int = 4):
+    """
+    Parallelizes ingestion across Eurostat datasets.
+    max_workers=4 is usually safe. If you hit API limits or DB pressure, reduce to 2.
+    """
     config = load_config()
     euro_cfg = config.get("eurostat", {}) if isinstance(config, dict) else {}
 
@@ -468,9 +565,32 @@ def main(mode: str = "initial"):
         logger.warning("No 'eurostat' section in config.")
         return
 
-    for dataset_code, dataset_cfg in euro_cfg.items():
-        ingest_dataset(dataset_code, dataset_cfg or {}, mode=mode)
+    items = list(euro_cfg.items())
+
+    logger.info(f"Eurostat main: mode={mode}, datasets={len(items)}, max_workers={max_workers}")
+
+    #galima isjungti - max_workers=1
+    if max_workers <= 1:
+        for dataset_code, dataset_cfg in items:
+            ingest_dataset(dataset_code, dataset_cfg or {}, mode=mode)
+        return
+
+    # Parallel execution
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(ingest_dataset, dataset_code, (dataset_cfg or {}), mode): dataset_code
+            for dataset_code, dataset_cfg in items
+        }
+
+        for fut in as_completed(futures):
+            code = futures[fut]
+            try:
+                fut.result()
+            except Exception as e:
+                logger.error(f"Dataset {code} failed: {e}")
 
 
 if __name__ == "__main__":
-    main(mode="initial")
+    # initial load: main("initial", max_workers=4)
+    # update run:   main("update",  max_workers=4)
+    main(mode="initial", max_workers=4)

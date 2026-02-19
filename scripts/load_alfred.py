@@ -3,12 +3,15 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-
+import time
 import pandas as pd
 import yaml
 from sqlalchemy import create_engine, text
 from fredapi import Fred
 from dotenv import load_dotenv
+from io import StringIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Iterable, Tuple
 
 load_dotenv()
 
@@ -24,29 +27,23 @@ if not API_KEY:
 fred = Fred(api_key=API_KEY) if API_KEY else None
 
 # Path to config
-CONFIG_PATH = Path(r"C:\Users\artur\bvp_prognozavimo_db\config\datasets.yaml")  # <- поменяй, если у тебя другой путь
+CONFIG_PATH = Path(__file__).parent.parent / "config" / "datasets.yaml"
+FALLBACK_CONFIG = Path(__file__).with_name("datasets.yaml")
 
+
+class Timer:
+    def __init__(self, label: str):
+        self.label = label
+        self.t0 = None
+
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        dt = time.perf_counter() - (self.t0 or time.perf_counter())
+        logger.info(f"[TIMER] {self.label}: {dt:.2f}s")
 # -------------------- DB helpers --------------------
-def last_release_hash(conn, source_id: int, scope: str | None = None) -> str | None:
-    if scope:
-        q = """
-        SELECT content_hash
-        FROM releases
-        WHERE source_id=:sid AND meta->>'scope' = :scope
-        ORDER BY downloaded_at DESC
-        LIMIT 1
-        """
-        return conn.execute(text(q), {"sid": source_id, "scope": scope}).scalar_one_or_none()
-
-    q = """
-    SELECT content_hash
-    FROM releases
-    WHERE source_id=:sid
-    ORDER BY downloaded_at DESC
-    LIMIT 1
-    """
-    return conn.execute(text(q), {"sid": source_id}).scalar_one_or_none()
-
 def vintage_exists(conn, series_id: int, vintage_at: datetime) -> bool:
     return conn.execute(text("""
         SELECT 1 FROM observations
@@ -62,7 +59,7 @@ def ensure_source(conn, name: str) -> int:
     return conn.execute(text("SELECT id FROM sources WHERE name=:name"), {"name": name}).scalar_one()
 
 def ensure_series(conn, source_id: int, key: str, country: str, frequency: str,
-                  transform: str, unit: str, name: str, meta: dict) -> int:
+                  transform: str, unit: Optional[str], name: str, meta: dict) -> int:
     meta_json = json.dumps(meta, ensure_ascii=False)
     return conn.execute(text("""
         INSERT INTO series (source_id, key, country, frequency, transform, unit, name, meta)
@@ -84,7 +81,8 @@ def ensure_series(conn, source_id: int, key: str, country: str, frequency: str,
     }).scalar_one()
 
 def create_release(conn, source_id: int, downloaded_at: datetime, vintage_at: datetime,
-                   description: str, raw_path: str | None = None, content_hash: str | None = None, scope: str | None = None, meta: dict | None = None) -> int:
+                   description: str, raw_path: str | None = None, content_hash: str | None = None,
+                   scope: str | None = None, meta: dict | None = None) -> int:
     meta = meta or {}
     if scope:
         meta["scope"] = scope
@@ -104,6 +102,56 @@ def create_release(conn, source_id: int, downloaded_at: datetime, vintage_at: da
         "meta": meta_json
     }).scalar_one()
 
+def _get_dbapi_connection(sa_conn):
+    # SQLAlchemy 2.x-safe
+    raw = sa_conn.connection
+    dbapi = getattr(raw, "driver_connection", None)
+    if dbapi is None:
+        # fallback for older
+        dbapi = getattr(raw, "connection", None) or raw
+    return dbapi
+
+
+def copy_observations_via_staging(
+    conn,
+    rows: Iterable[Tuple[int, str, str, float, int]]
+):
+    """
+    rows: (series_id, period_date_iso, observed_at_iso, value, release_id)
+    """
+    conn.execute(text("""
+        CREATE TEMP TABLE IF NOT EXISTS observations_staging (
+            series_id   BIGINT,
+            period_date DATE,
+            observed_at TIMESTAMPTZ,
+            value       DOUBLE PRECISION,
+            release_id  BIGINT
+        ) ON COMMIT DROP
+    """))
+    conn.execute(text("TRUNCATE TABLE observations_staging"))
+
+    buf = StringIO()
+    for sid, pdate_iso, oat_iso, val, rid in rows:
+        buf.write(f"{sid},{pdate_iso},{oat_iso},{val},{rid}\n")
+    buf.seek(0)
+
+    dbapi_conn = _get_dbapi_connection(conn)
+    cur = dbapi_conn.cursor()
+    cur.copy_expert(
+        """
+        COPY observations_staging (series_id, period_date, observed_at, value, release_id)
+        FROM STDIN WITH (FORMAT csv)
+        """,
+        buf
+    )
+
+    conn.execute(text("""
+        INSERT INTO observations (series_id, period_date, observed_at, value, release_id, meta)
+        SELECT series_id, period_date, observed_at, value, release_id, '{}'::jsonb
+        FROM observations_staging
+        ON CONFLICT (series_id, period_date, observed_at) DO NOTHING
+    """))
+
 # -------------------- Config --------------------
 
 def load_config() -> dict:
@@ -113,125 +161,171 @@ def load_config() -> dict:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
+# -------------------- FRED helpers --------------------
+def _ensure_tz_utc(dt) -> datetime:
+    if getattr(dt, "tzinfo", None) is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def fetch_series_info(series_key: str):
+    return fred.get_series_info(series_key)
+
+
+def fetch_vintage_dates(series_key: str):
+    return fred.get_series_vintage_dates(series_key)
+
+
+def fetch_series_vintage(series_key: str, vintage_at: datetime) -> pd.Series:
+    v_str = vintage_at.strftime("%Y-%m-%d")
+    return fred.get_series(series_key, realtime_start=v_str, realtime_end=v_str)
+
+
 # -------------------- Core --------------------
-
-def fetch_and_ingest_series(series_key: str, realtime: bool = True, max_vintages: int = 10, mode: str = "initial"):
+def ingest_one_series(series_key: str, realtime: bool, max_vintages: int, mode: str) -> dict:
+    """
+    summary dict.
+    """
     if not fred:
-        logger.error("FRED client not initialized (missing API key).")
-        return
+        return {"series": series_key, "status": "fail", "error": "fred client not initialized"}
 
-    logger.info(f"Series: {series_key}")
-
-    # 1) Series info (metadata)
-    try:
-        info = fred.get_series_info(series_key)
-    except Exception as e:
-        logger.error(f"Failed to get info for {series_key}: {e}")
-        return
-
-    frequency = info.get("frequency_short", "M") or "M"
-    units = info.get("units") or None
-    title = info.get("title") or series_key
-
-    # 2) Vintage dates
-    target_vintages = []
-    if realtime:
+    with Timer(f"ALFRED series total {series_key}"):
+        # 1) metadata
         try:
-            vintage_dates = fred.get_series_vintage_dates(series_key)
-            # take last max_vintages to reduce workload
-            target_vintages = list(vintage_dates[-max_vintages:]) if vintage_dates is not None else []
+            with Timer(f"ALFRED info {series_key}"):
+                info = fetch_series_info(series_key)
         except Exception as e:
-            logger.error(f"Failed to get vintage dates for {series_key}: {e}")
-            return
-    if not target_vintages:
-        # fallback: current only
-        target_vintages = [datetime.now(timezone.utc)]
+            return {"series": series_key, "status": "fail", "error": f"info failed: {e}"}
 
-    with engine.begin() as conn:
-        source_id = ensure_source(conn, "alfred")
+        frequency = info.get("frequency_short", "M") or "M"
+        units = info.get("units") or None
+        title = info.get("title") or series_key
 
-        db_series_id = ensure_series(
-            conn=conn,
-            source_id=source_id,
-            key=series_key,
-            country="US",
-            frequency=frequency,
-            transform="LEVEL",
-            unit=units,
-            name=title,
-            meta={"fred_info": info.to_dict() if hasattr(info, "to_dict") else dict(info)}
-        )
+        # 2) vintages
+        target_vintages = []
+        if realtime:
+            try:
+                with Timer(f"ALFRED vintages {series_key}"):
+                    vds = fetch_vintage_dates(series_key)
+                if vds is not None and len(vds) > 0:
+                    target_vintages = list(vds[-max_vintages:])
+            except Exception as e:
+                return {"series": series_key, "status": "fail", "error": f"vintage dates failed: {e}"}
 
-        total_inserted = 0
-        total_failed = 0
+        if not target_vintages:
+            target_vintages = [datetime.now(timezone.utc)]
 
-        for v_date in target_vintages:
-            # ensure tz-aware
-            if getattr(v_date, "tzinfo", None) is None:
-                vintage_at = v_date.replace(tzinfo=timezone.utc)
-            else:
-                vintage_at = v_date.astimezone(timezone.utc)
+        inserted_attempted = 0
+        failed = 0
+        skipped_vintages = 0
+        processed_vintages = 0
 
-            if mode == "update" and vintage_exists(conn, db_series_id, vintage_at):
-                logger.info(f"Skip vintage {vintage_at.date()} (already in DB)")
-                continue
+        with engine.begin() as conn:
+            source_id = ensure_source(conn, "alfred")
 
-            downloaded_at = datetime.now(timezone.utc)
-
-            # Create release per vintage
-            release_id = create_release(
+            db_series_id = ensure_series(
                 conn=conn,
                 source_id=source_id,
-                downloaded_at=downloaded_at,
-                vintage_at=vintage_at,
-                description=f"ALFRED vintage for {series_key} ({vintage_at.date().isoformat()})"
+                key=series_key,
+                country="US",
+                frequency=frequency,
+                transform="LEVEL",
+                unit=units,
+                name=title,
+                meta={"fred_info": info.to_dict() if hasattr(info, "to_dict") else dict(info)}
             )
 
-            v_str = vintage_at.strftime("%Y-%m-%d")
-            logger.info(f"  Vintage: {v_str}")
+            #batch size for COPY
+            COPY_BATCH = 200_000
 
-            try:
-                data = fred.get_series(series_key, realtime_start=v_str, realtime_end=v_str)
+            for v_date in target_vintages:
+                vintage_at = _ensure_tz_utc(v_date)
+
+                if mode == "update" and vintage_exists(conn, db_series_id, vintage_at):
+                    skipped_vintages += 1
+                    continue
+
+                downloaded_at = datetime.now(timezone.utc)
+
+                #kuriam release jei tik iterpinesim vintage'a
+                release_id = create_release(
+                    conn=conn,
+                    source_id=source_id,
+                    downloaded_at=downloaded_at,
+                    vintage_at=vintage_at,
+                    description=f"ALFRED vintage for {series_key} ({vintage_at.date().isoformat()})",
+                    scope=f"series:{series_key}|vintage:{vintage_at.date().isoformat()}",
+                    meta={"series": series_key, "vintage": vintage_at.date().isoformat(), "mode": mode}
+                )
+
+                processed_vintages += 1
+
+                try:
+                    with Timer(f"ALFRED fetch data {series_key} {vintage_at.date().isoformat()}"):
+                        data = fetch_series_vintage(series_key, vintage_at)
+                except Exception as e:
+                    failed += 1
+                    logger.error(f"{series_key}: vintage {vintage_at.date().isoformat()} fetch failed: {e}")
+                    continue
+
                 if data is None or len(data) == 0:
                     continue
 
+                rows = []
+                # data: pandas Series index=Timestamp
                 for p_date, value in data.items():
                     if pd.isna(value):
                         continue
-                    try:
-                        conn.execute(text("""
-                            INSERT INTO observations (series_id, period_date, observed_at, value, release_id, meta)
-                            VALUES (:sid, :pdate, :oat, :val, :rid, '{}'::jsonb)
-                            ON CONFLICT (series_id, period_date, observed_at) DO NOTHING
-                        """), {
-                            "sid": db_series_id,
-                            "pdate": p_date.date(),
-                            "oat": vintage_at,     # <-- real vintage
-                            "val": float(value),
-                            "rid": release_id
-                        })
-                        total_inserted += 1
-                    except Exception:
-                        total_failed += 1
+                    rows.append((
+                        db_series_id,
+                        p_date.date().isoformat(),
+                        vintage_at.isoformat(),
+                        float(value),
+                        release_id
+                    ))
+                    if len(rows) >= COPY_BATCH:
+                        copy_observations_via_staging(conn, rows)
+                        inserted_attempted += len(rows)
+                        rows = []
 
-            except Exception as e:
-                total_failed += 1
-                logger.error(f"Failed vintage {v_str} for {series_key}: {e}")
+                if rows:
+                    copy_observations_via_staging(conn, rows)
+                    inserted_attempted += len(rows)
 
-        conn.execute(text("""
-            INSERT INTO ingestion_log (source_id, status, rows_inserted, rows_failed, details)
-            VALUES (:source_id, :status, :ins, :fail, CAST(:details AS jsonb))
-        """), {
-            "source_id": source_id,
-            "status": "ok" if total_failed == 0 else "ok_with_errors",
-            "ins": total_inserted,
-            "fail": total_failed,
-            "details": json.dumps({"series": series_key, "vintages": len(target_vintages)}, ensure_ascii=False)
-        })
+            #ingestion_log on series level
+            conn.execute(text("""
+                INSERT INTO ingestion_log (source_id, status, rows_inserted, rows_failed, details)
+                VALUES (:source_id, :status, :ins, :fail, CAST(:details AS jsonb))
+            """), {
+                "source_id": source_id,
+                "status": "ok" if failed == 0 else "ok_with_errors",
+                "ins": int(inserted_attempted),
+                "fail": int(failed),
+                "details": json.dumps({
+                    "series": series_key,
+                    "mode": mode,
+                    "realtime": realtime,
+                    "vintages_target": len(target_vintages),
+                    "vintages_processed": processed_vintages,
+                    "vintages_skipped": skipped_vintages,
+                    "attempted_rows": inserted_attempted,
+                    "frequency": frequency,
+                    "unit": units
+                }, ensure_ascii=False)
+            })
 
-    logger.info(f"Done {series_key}: inserted={total_inserted}, failed={total_failed}")
+        return {
+            "series": series_key,
+            "status": "ok" if failed == 0 else "ok_with_errors",
+            "attempted": inserted_attempted,
+            "failed": failed,
+            "vintages_target": len(target_vintages),
+            "vintages_processed": processed_vintages,
+            "vintages_skipped": skipped_vintages,
+        }
 
-def main():
+
+def main(mode: str = "update", max_workers: int = 2, max_vintages: int = 10):
     config = load_config()
     alfred_cfg = config.get("alfred", {}) if isinstance(config, dict) else {}
 
@@ -243,14 +337,34 @@ def main():
         logger.warning("No 'alfred' section in config.")
         return
 
-    # expected format:
-    # alfred:
-    #   GDPC1: {realtime: true}
-    for series_key, details in alfred_cfg.items():
-        realtime = True
-        if isinstance(details, dict):
-            realtime = bool(details.get("realtime", True))
-        fetch_and_ingest_series(series_key, realtime=realtime, max_vintages=10, mode="update")
+    items = list(alfred_cfg.items())
+    logger.info(f"ALFRED main: mode={mode}, series={len(items)}, max_workers={max_workers}, max_vintages={max_vintages}")
+
+    if max_workers <= 1:
+        for series_key, details in items:
+            realtime = True
+            if isinstance(details, dict):
+                realtime = bool(details.get("realtime", True))
+            res = ingest_one_series(series_key, realtime=realtime, max_vintages=max_vintages, mode=mode)
+            logger.info(f"ALFRED result: {res}")
+        return
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {}
+        for series_key, details in items:
+            realtime = True
+            if isinstance(details, dict):
+                realtime = bool(details.get("realtime", True))
+            futures[ex.submit(ingest_one_series, series_key, realtime, max_vintages, mode)] = series_key
+
+        for fut in as_completed(futures):
+            series_key = futures[fut]
+            try:
+                res = fut.result()
+                logger.info(f"ALFRED result {series_key}: {res}")
+            except Exception as e:
+                logger.error(f"ALFRED series {series_key} failed: {e}")
+
 
 if __name__ == "__main__":
-    main()
+    main(mode="update", max_workers=2, max_vintages=10)

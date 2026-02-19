@@ -1,10 +1,105 @@
 yahoo_finance:
+#Lietuva
   "^OMXV":
     name: "OMX Vilnius Index"
-  "BZ=F":
-    name: "Brent Crude Oil"
+  "APG1L.VL":
+    name: "Apranga"
+  "TEL1L.VL":
+    name: "Telia Lietuva"
+  "SAB1L.VL":
+    name: "Šiaulių bankas"
+  "IGN1L.VL":
+    name: "Ignitis grupė"
+  "RSU1L.VL":
+    name: "Rokiškio sūris"
+
+  #US Indices
+  "^GSPC":
+    name: "S&P 500"
+  "^DJI":
+    name: "Dow Jones Industrial Average"
+  "^IXIC":
+    name: "Nasdaq Composite"
+  "^RUT":
+    name: "Russell 2000"
+
+  #Europe Indices
+  "^STOXX50E":
+    name: "Euro Stoxx 50"
+  "^GDAXI":
+    name: "DAX"
+  "^FCHI":
+    name: "CAC 40"
+  "^FTSE":
+    name: "FTSE 100"
+
+  #Asia
+  "^N225":
+    name: "Nikkei 225"
+  "^HSI":
+    name: "Hang Seng"
+
+  #Currencies
   "EURUSD=X":
     name: "EUR/USD Exchange Rate"
+  "EURGBP=X":
+    name: "EUR/GBP Exchange Rate"
+  "EURJPY=X":
+    name: "EUR/JPY Exchange Rate"
+  "EURPLN=X":
+    name: "EUR/PLN Exchange Rate"
+  "GBPUSD=X":
+    name: "GBP/USD Exchange Rate"
+
+  #Commodities
+  "BZ=F":
+    name: "Brent Crude Oil"
+  "CL=F":
+    name: "WTI Crude Oil"
+  "NG=F":
+    name: "Natural Gas"
+  "GC=F":
+    name: "Gold"
+  "SI=F":
+    name: "Silver"
+  "HG=F":
+    name: "Copper"
+  "ZC=F":
+    name: "Corn"
+  "ZW=F":
+    name: "Wheat"
+  "ZS=F":
+    name: "Soybeans"
+
+  #Bonds / Rates
+  "^TNX":
+    name: "US 10Y Treasury Yield"
+  "^IRX":
+    name: "US 3M Treasury Yield"
+  "^FVX":
+    name: "US 5Y Treasury Yield"
+  "^TYX":
+    name: "US 30Y Treasury Yield"
+
+  #ETFs (Macro proxies)
+  "SPY":
+    name: "SPDR S&P 500 ETF"
+  "QQQ":
+    name: "Invesco QQQ ETF"
+  "IWM":
+    name: "iShares Russell 2000 ETF"
+  "EEM":
+    name: "iShares MSCI Emerging Markets ETF"
+  "VGK":
+    name: "Vanguard FTSE Europe ETF"
+  "VWO":
+    name: "Vanguard Emerging Markets ETF"
+  "XLE":
+    name: "Energy Select Sector SPDR ETF"
+  "XLF":
+    name: "Financial Select Sector SPDR ETF"
+  "XLK":
+    name: "Technology Select Sector SPDR ETF"
 
 google_trends:
   keywords:
@@ -133,24 +228,164 @@ eurostat:
 
   namq_10_pc:
     name: "Private consumption"
-    filters: {}
+    filters:
+      geo: ["LT"]
 
   namq_10_cfc:
     name: "Capital formation"
-    filters: {}
+    filters:
+      geo: ["LT"]
 
   namq_10_exi:
     name: "Exports/imports (quarterly)"
-    filters: {}
+    filters:
+      geo: ["LT"]
 
   nama_10_lp_ulc:
     name: "Labour productivity & unit labour costs"
-    filters: {}
+    filters:
+      geo: ["LT"]
 
   nama_10_a10_e:
     name: "Value added by industry"
-    filters: {}
+    filters:
+      geo: ["LT"]
 
+  lfsi_emp_q:
+    name: "Employment (quarterly)"
+    filters:
+      geo: ["LT"]
+
+  lfsi_unemp_q:
+    name: "Unemployed persons"
+    filters:
+      geo: ["LT"]
+
+
+  lfsi_long_q:
+    name: "Long-term unemployment"
+    filters:
+      geo: ["LT"]
+
+  earn_ses_monthly:
+    name: "Long-term unemployment"
+    filters:
+      geo: ["LT"]
+
+  lc_lci_r2_q:
+    name: "Labour cost index"
+    filters:
+      geo: ["LT"]
+
+  lfsi_part_a:
+    name: "Labour force participation"
+    filters:
+      geo: ["LT"]
+
+  prc_ppi_m:
+    name: "Producer price index"
+    filters:
+      geo: ["LT"]
+
+  prc_fsc_idx:
+    name: "Food price index"
+    filters:
+      geo: ["LT"]
+
+  prc_hicp_aind:
+    name: "HICP by components"
+    filters:
+      geo: ["LT"]
+
+  prc_hpi_q:
+    name: "House price index"
+    filters:
+      geo: ["LT"]
+
+  ei_bcs_m:
+    name: "Consumer confidence"
+    filters:
+      geo: ["LT"]
+
+  ei_bcs_i:
+    name: "Industrial confidence"
+    filters:
+      geo: ["LT"]
+
+  sts_cinpr_m:
+    name: "Construction price index"
+    filters:
+      geo: ["LT"]
+
+  sbs_na_ind_r2:
+    name: "Structural business stats"
+    filters:
+      geo: ["LT"]
+
+  sbs_sc_sca_r2:
+    name: "Services"
+    filters:
+      geo: ["LT"]
+
+  sbs_na_sca_r2:
+    name: "Turnover"
+    filters:
+      geo: ["LT"]
+
+  env_wasmun:
+    name: "Municipal waste"
+    filters:
+      geo: ["LT"]
+
+  ext_lt_maineu:
+    name: "Trade with EU"
+    filters:
+      geo: ["LT"]
+
+  ext_lt_introle:
+    name: "Trade balance"
+    filters:
+      geo: ["LT"]
+
+  ext_lt_intratrd:
+    name: "Intrastat trade"
+    filters:
+      geo: ["LT"]
+
+  ext_lt_extra:
+    name: "Extra-EU trade"
+    filters:
+      geo: ["LT"]
+
+  tet00002:
+    name: "Export value"
+    filters:
+      geo: ["LT"]
+
+  tet00003:
+    name: "Import value"
+    filters:
+      geo: ["LT"]
+
+  ert_bil_eur_m:
+    name: "Bilateral trade"
+    filtres:
+      geo: ["LT"]
+
+  bop_q_c:
+    name: "Balance of payments"
+    filters:
+      geo: ["LT"]
+
+  bop_iip_q:
+    name: "International investment position"
+    filters:
+      geo: ["LT"]
+
+  tec00021:
+    name: "Current account"
+    filters:
+      geo: ["LT"]
 
   prc_hicp_midx:
     name: "HICP - Harmonised Index of Consumer Prices (Monthly)"

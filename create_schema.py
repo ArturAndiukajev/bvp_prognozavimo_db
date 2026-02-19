@@ -76,6 +76,14 @@ CREATE TABLE ingestion_log (
   details       JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
+CREATE TEMP TABLE observations_staging (
+    series_id   BIGINT,
+    period_date DATE,
+    observed_at TIMESTAMPTZ,
+    value       DOUBLE PRECISION,
+    release_id  BIGINT
+) ON COMMIT DROP;
+
 -- Useful indexes
 CREATE INDEX ix_series_source_id ON series(source_id);
 CREATE INDEX ix_observations_series_period ON observations(series_id, period_date);

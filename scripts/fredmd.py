@@ -2,11 +2,13 @@ import json
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Tuple, Dict
-
+from typing import Tuple, Dict, Optional
+import time
 import pandas as pd
 import requests
 from sqlalchemy import create_engine, text
+from contextlib import contextmanager
+from io import StringIO
 
 DB_URL = "postgresql+psycopg2://nowcast:nowcast@localhost:5432/nowcast_db"
 RAW_DIR = Path("data/raw")
@@ -141,7 +143,7 @@ def parse_fredmd(csv_path: Path) -> Tuple[pd.DataFrame, Dict]:
 
 def ingest(df_wide: pd.DataFrame, dataset_meta: dict,
            vintage_at: datetime, downloaded_at: datetime,
-           raw_path: str | None, content_hash: str | None) -> None:
+           raw_path: str | None, content_hash: str | None, mode: str = "initial") -> None:
     source_name = "fredmd"
     inserted = 0
     failed = 0
