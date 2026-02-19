@@ -131,6 +131,27 @@ eurostat:
       na_item: ["B1GQ", "P3", "P6", "P7"]
       geo: ["LT"]
 
+  namq_10_pc:
+    name: "Private consumption"
+    filters: {}
+
+  namq_10_cfc:
+    name: "Capital formation"
+    filters: {}
+
+  namq_10_exi:
+    name: "Exports/imports (quarterly)"
+    filters: {}
+
+  nama_10_lp_ulc:
+    name: "Labour productivity & unit labour costs"
+    filters: {}
+
+  nama_10_a10_e:
+    name: "Value added by industry"
+    filters: {}
+
+
   prc_hicp_midx:
     name: "HICP - Harmonised Index of Consumer Prices (Monthly)"
     filters:

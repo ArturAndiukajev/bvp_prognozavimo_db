@@ -14,7 +14,8 @@ DROP TABLE IF EXISTS sources CASCADE;
 CREATE TABLE sources (
   id          BIGSERIAL PRIMARY KEY,
   name        TEXT NOT NULL UNIQUE,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  meta JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
 CREATE TABLE series (
