@@ -18,8 +18,16 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("alfred")
 
-DB_URL = "postgresql+psycopg2://nowcast:nowcast@localhost:5432/nowcast_db"
-engine = create_engine(DB_URL, future=True)
+_DEFAULT_DB_URL = "postgresql+psycopg2://nowcast:nowcast@localhost:5432/nowcast_db"
+DB_URL = os.environ.get("DB_URL", _DEFAULT_DB_URL)
+engine = create_engine(
+    DB_URL,
+    future=True,
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=5,
+    connect_args={"connect_timeout": 10},
+)
 
 API_KEY = os.environ.get("FRED_API_KEY")
 if not API_KEY:
@@ -37,7 +45,7 @@ class Timer:
         self.t0 = None
 
     def __enter__(self):
-        self.t0 = time.perf_counter()
+        self.t0 = float(time.perf_counter())
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -51,26 +59,36 @@ def vintage_exists(conn, series_id: int, vintage_at: datetime) -> bool:
         LIMIT 1
     """), {"sid": series_id, "oat": vintage_at}).scalar_one_or_none() is not None
 
-def ensure_source(conn, name: str) -> int:
+def ensure_provider(conn, name: str, base_url: str | None = None) -> int:
     conn.execute(text("""
-        INSERT INTO sources (name) VALUES (:name)
+        INSERT INTO providers (name, base_url) VALUES (:name, :url)
         ON CONFLICT (name) DO NOTHING
-    """), {"name": name})
-    return conn.execute(text("SELECT id FROM sources WHERE name=:name"), {"name": name}).scalar_one()
+    """), {"name": name, "url": base_url})
+    return conn.execute(text("SELECT id FROM providers WHERE name=:name"), {"name": name}).scalar_one()
 
-def ensure_series(conn, source_id: int, key: str, country: str, frequency: str,
+def ensure_dataset(conn, provider_id: int, key: str, title: str | None = None) -> int:
+    conn.execute(text("""
+        INSERT INTO datasets (provider_id, key, title) VALUES (:pid, :key, :title)
+        ON CONFLICT (provider_id, key) DO UPDATE SET title = COALESCE(EXCLUDED.title, datasets.title)
+    """), {"pid": provider_id, "key": key, "title": title})
+    return conn.execute(
+        text("SELECT id FROM datasets WHERE provider_id=:pid AND key=:key"),
+        {"pid": provider_id, "key": key}
+    ).scalar_one()
+
+def ensure_series(conn, dataset_id: int, key: str, country: str, frequency: str,
                   transform: str, unit: Optional[str], name: str, meta: dict) -> int:
     meta_json = json.dumps(meta, ensure_ascii=False)
     return conn.execute(text("""
-        INSERT INTO series (source_id, key, country, frequency, transform, unit, name, meta)
-        VALUES (:sid, :key, :country, :freq, :transform, :unit, :name, CAST(:meta AS jsonb))
-        ON CONFLICT (source_id, key, country, frequency, transform)
+        INSERT INTO series (dataset_id, key, country, frequency, transform, unit, name, meta)
+        VALUES (:did, :key, :country, :freq, :transform, :unit, :name, CAST(:meta AS jsonb))
+        ON CONFLICT (dataset_id, key, country, frequency, transform)
         DO UPDATE SET unit = EXCLUDED.unit,
                       name = EXCLUDED.name,
                       meta = EXCLUDED.meta
         RETURNING id
     """), {
-        "sid": source_id,
+        "did": dataset_id,
         "key": key,
         "country": country,
         "freq": frequency,
@@ -80,7 +98,7 @@ def ensure_series(conn, source_id: int, key: str, country: str, frequency: str,
         "meta": meta_json
     }).scalar_one()
 
-def create_release(conn, source_id: int, downloaded_at: datetime, vintage_at: datetime,
+def create_release(conn, dataset_id: int, downloaded_at: datetime, vintage_at: datetime,
                    description: str, raw_path: str | None = None, content_hash: str | None = None,
                    scope: str | None = None, meta: dict | None = None) -> int:
     meta = meta or {}
@@ -88,11 +106,11 @@ def create_release(conn, source_id: int, downloaded_at: datetime, vintage_at: da
         meta["scope"] = scope
     meta_json = json.dumps(meta, ensure_ascii=False)
     return conn.execute(text("""
-        INSERT INTO releases (source_id, release_time, downloaded_at, vintage_at, description, raw_path, content_hash, meta)
-        VALUES (:sid, :rtime, :dlat, :vint, :desc, :raw, :hash, CAST(:meta AS jsonb))
+        INSERT INTO releases (dataset_id, release_time, downloaded_at, vintage_at, description, raw_path, content_hash, meta)
+        VALUES (:did, :rtime, :dlat, :vint, :desc, :raw, :hash, CAST(:meta AS jsonb))
         RETURNING id
     """), {
-        "sid": source_id,
+        "did": dataset_id,
         "rtime": downloaded_at,
         "dlat": downloaded_at,
         "vint": vintage_at,
@@ -102,13 +120,11 @@ def create_release(conn, source_id: int, downloaded_at: datetime, vintage_at: da
         "meta": meta_json
     }).scalar_one()
 
-def _get_dbapi_connection(sa_conn):
-    # SQLAlchemy 2.x-safe
-    raw = sa_conn.connection
-    dbapi = getattr(raw, "driver_connection", None)
-    if dbapi is None:
-        # fallback for older
-        dbapi = getattr(raw, "connection", None) or raw
+def _get_psycopg2_connection(sa_conn):
+    raw = getattr(sa_conn, "connection", None)
+    if raw is None:
+        raise RuntimeError("Cannot access raw DBAPI connection")
+    dbapi = getattr(raw, "connection", None) or getattr(raw, "driver_connection", None) or raw
     return dbapi
 
 
@@ -135,7 +151,7 @@ def copy_observations_via_staging(
         buf.write(f"{sid},{pdate_iso},{oat_iso},{val},{rid}\n")
     buf.seek(0)
 
-    dbapi_conn = _get_dbapi_connection(conn)
+    dbapi_conn = _get_psycopg2_connection(conn)
     cur = dbapi_conn.cursor()
     cur.copy_expert(
         """
@@ -221,11 +237,12 @@ def ingest_one_series(series_key: str, realtime: bool, max_vintages: int, mode: 
         processed_vintages = 0
 
         with engine.begin() as conn:
-            source_id = ensure_source(conn, "alfred")
+            provider_id = ensure_provider(conn, "alfred", base_url="https://alfred.stlouisfed.org/")
+            dataset_id  = ensure_dataset(conn, provider_id, key=series_key, title=title)
 
             db_series_id = ensure_series(
                 conn=conn,
-                source_id=source_id,
+                dataset_id=dataset_id,
                 key=series_key,
                 country="US",
                 frequency=frequency,
@@ -250,7 +267,7 @@ def ingest_one_series(series_key: str, realtime: bool, max_vintages: int, mode: 
                 #kuriam release jei tik iterpinesim vintage'a
                 release_id = create_release(
                     conn=conn,
-                    source_id=source_id,
+                    dataset_id=dataset_id,
                     downloaded_at=downloaded_at,
                     vintage_at=vintage_at,
                     description=f"ALFRED vintage for {series_key} ({vintage_at.date().isoformat()})",
@@ -294,10 +311,10 @@ def ingest_one_series(series_key: str, realtime: bool, max_vintages: int, mode: 
 
             #ingestion_log on series level
             conn.execute(text("""
-                INSERT INTO ingestion_log (source_id, status, rows_inserted, rows_failed, details)
-                VALUES (:source_id, :status, :ins, :fail, CAST(:details AS jsonb))
+                INSERT INTO ingestion_log (dataset_id, status, rows_inserted, rows_failed, details)
+                VALUES (:dataset_id, :status, :ins, :fail, CAST(:details AS jsonb))
             """), {
-                "source_id": source_id,
+                "dataset_id": dataset_id,
                 "status": "ok" if failed == 0 else "ok_with_errors",
                 "ins": int(inserted_attempted),
                 "fail": int(failed),

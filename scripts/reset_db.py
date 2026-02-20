@@ -13,7 +13,7 @@ engine = create_engine(DB_URL, future=True)
 def reset_db(force=False):
     if not force:
         print("WARNING: This will delete ALL data from the database.")
-        print("This includes all observations, series definitions, sources, and logs.")
+        print("This includes all observations, series definitions, providers, datasets, and logs.")
         confirm = input("Type 'DELETE' to confirm: ")
         if confirm != "DELETE":
             print("Aborted.")
@@ -22,15 +22,11 @@ def reset_db(force=False):
     logger.info("Resetting database...")
     
     with engine.begin() as conn:
-        # Disable triggers if needed, but simple truncate is usually fine
-        # CASCADE ensures child tables (observations, series) are cleared when parent (sources) is cleared
-        # though usually we want to clear observations first
-        
-        # Order matters if no CASCADE, but CASCADE handles it.
-        # Clearing observations first is safer for large tables.
+        # CASCADE on providers/datasets propagates to series -> observations.
+        # We truncate in child-first order for safety.
         
         logger.info("Truncating tables...")
-        conn.execute(text("TRUNCATE TABLE observations, series, sources, ingestion_log RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE TABLE observations, series, releases, ingestion_log, datasets, providers RESTART IDENTITY CASCADE"))
         
     logger.info("Database reset complete. All tables are empty.")
 
