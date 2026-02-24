@@ -1,6 +1,6 @@
 import logging
 import create_schema
-from scripts import fredmd
+from scripts import load_fredmd
 from scripts import load_alfred
 from scripts import load_eurostat
 from scripts import load_google_trends
@@ -22,7 +22,7 @@ def main():
     try:
         print("--- FRED-MD ---")
         logger.info("--- FRED-MD ---")
-        fredmd.main(mode="initial")
+        load_fredmd.main(mode="initial")
     except Exception as e:
         print(f"FRED-MD failed: {e}")
         logger.error(f"FRED-MD failed: {e}")

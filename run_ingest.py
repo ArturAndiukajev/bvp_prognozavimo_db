@@ -1,7 +1,7 @@
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from scripts import fredmd, load_alfred, load_eurostat, load_google_trends, load_financials
+from scripts import load_fredmd, load_alfred, load_eurostat, load_google_trends, load_financials
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("IngestionRunner")
@@ -21,13 +21,10 @@ def main(mode: str = "initial"):
     logger.info(f"=== Starting Master Ingestion (mode={mode}) ===")
     start_time = time.time()
 
-    # -----------------------------------------------------------
-    # Wave 1: Fast / lightweight loaders — run in parallel
-    # fredmd (~1-2 min), alfred (~1 min), financials (~2-3 min)
-    # -----------------------------------------------------------
+    # Wave 1: Fast / lightweight
     logger.info("Wave 1: launching fast loaders in parallel")
     wave1 = {
-        "FRED-MD":    lambda: fredmd.main(mode=mode),
+        "FRED-MD":    lambda: load_fredmd.main(mode=mode),
         "ALFRED":     lambda: load_alfred.main(mode=mode),
         "Financials": lambda: load_financials.main(mode=mode),
     }
@@ -36,10 +33,7 @@ def main(mode: str = "initial"):
         for fut in as_completed(futs):
             fut.result()  # exceptions were already logged inside _run_loader
 
-    # -----------------------------------------------------------
-    # Wave 2: Slow / API-heavy loaders — run in parallel
-    # eurostat (~30 min), google_trends (~20 min)
-    # -----------------------------------------------------------
+    # Wave 2: Slow / API-heavy
     logger.info("Wave 2: launching slow loaders in parallel")
     wave2 = {
         "Eurostat":       lambda: load_eurostat.main(mode=mode),

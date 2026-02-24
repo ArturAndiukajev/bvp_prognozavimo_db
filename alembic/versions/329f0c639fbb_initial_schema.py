@@ -1,31 +1,23 @@
-import os
-from sqlalchemy import create_engine, text
-from dotenv import load_dotenv
+"""initial schema
 
-load_dotenv()
+Revision ID: 329f0c639fbb
+Revises: 
+Create Date: 2026-02-23 15:19:58.557403
 
-_DEFAULT_DB_URL = "postgresql+psycopg2://nowcast:nowcast@localhost:5432/nowcast_db"
-DB_URL = os.environ.get("DB_URL", _DEFAULT_DB_URL)
-engine = create_engine(
-    DB_URL,
-    future=True,
-    pool_pre_ping=True,
-    connect_args={"connect_timeout": 10},
-)
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = '329f0c639fbb'
+down_revision: Union[str, Sequence[str], None] = None
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
 
 DDL = """
--- Drop all tables in dependency order
-DROP TABLE IF EXISTS ingestion_log CASCADE;
-DROP TABLE IF EXISTS observations CASCADE;
-DROP TABLE IF EXISTS releases CASCADE;
-DROP TABLE IF EXISTS series CASCADE;
-DROP TABLE IF EXISTS datasets CASCADE;
-DROP TABLE IF EXISTS providers CASCADE;
-
--- ============================================================
--- providers = original source system
---   e.g. 'eurostat', 'alfred', 'yahoo_finance', 'google_trends', 'fredmd'
--- ============================================================
 CREATE TABLE providers (
   id          BIGSERIAL PRIMARY KEY,
   name        TEXT NOT NULL UNIQUE,
@@ -137,13 +129,16 @@ CREATE INDEX ix_observations_release_id     ON observations(release_id);
 CREATE INDEX ix_ingestion_log_dataset_time  ON ingestion_log(dataset_id, run_time DESC);
 CREATE INDEX ix_observations_series_latest  ON observations(series_id, period_date DESC, observed_at DESC);
 """
+def upgrade() -> None:
+    op.execute(DDL)
 
 
-def main():
-    with engine.begin() as conn:
-        conn.execute(text(DDL))
-    print("Schema created successfully.")
-
-
-if __name__ == "__main__":
-    main()
+def downgrade() -> None:
+    op.execute("""
+       DROP TABLE IF EXISTS ingestion_log CASCADE;
+       DROP TABLE IF EXISTS observations CASCADE;
+       DROP TABLE IF EXISTS releases CASCADE;
+       DROP TABLE IF EXISTS series CASCADE;
+       DROP TABLE IF EXISTS datasets CASCADE;
+       DROP TABLE IF EXISTS providers CASCADE;
+       """)

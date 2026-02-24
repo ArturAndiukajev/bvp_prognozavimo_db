@@ -1,5 +1,5 @@
 import logging
-from scripts import fredmd
+from scripts import load_fredmd
 from scripts import load_alfred
 from scripts import load_eurostat
 from scripts import load_google_trends
@@ -12,7 +12,7 @@ def main():
     logger.info("=== UPDATE RUN START ===")
 
     # Predictors panel
-    fredmd.main(mode="update")
+    load_fredmd.main(mode="update")
 
     # Key macro + vintages
     load_alfred.main(mode="update")

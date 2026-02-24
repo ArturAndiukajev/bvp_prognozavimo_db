@@ -12,7 +12,24 @@ yahoo_finance:
     name: "Ignitis grupė"
   "RSU1L.VL":
     name: "Rokiškio sūris"
-
+  "^VIX":
+    name: "Volatility index"
+  "^MOVE":
+    name: "Obligacijos"
+  "HYG":
+    name: "High Yield Corporate Bond"
+  "^WIG20":
+    name: "Lenkijos fondų indeksas"
+  "^BDI":
+    name: "Baltic Dry Index"
+  "XLI":
+    name: "industrials"
+  "XHB":
+    name: "homebuilders"
+  "ITA":
+    name: "aerospace"
+  "SOXX":
+    name: "semiconductors"
   #US Indices
   "^GSPC":
     name: "S&P 500"
@@ -38,6 +55,8 @@ yahoo_finance:
     name: "Nikkei 225"
   "^HSI":
     name: "Hang Seng"
+  "000001.SS":
+    name: "Shanghai Composite"
 
   #Currencies
   "EURUSD=X":
@@ -209,6 +228,9 @@ google_trends:
 alfred:
   GDP:
     name: "US GDP"
+    realtime: true
+  GDPC1:
+    name: "US Real GDP"
     realtime: true
   CPIAUCSL:
     name: "US CPI"
