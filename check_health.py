@@ -1,9 +1,5 @@
 """
 check_health.py — Database health and freshness monitoring script.
-
-Run with:
-    python check_health.py
-
 Outputs per-source freshness, row counts, stale-detection, and
 flags any source that hasn't been updated recently.
 """
