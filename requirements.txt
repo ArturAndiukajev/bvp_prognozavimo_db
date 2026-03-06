@@ -1,0 +1,10 @@
+pandas>=2.0
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+pyyaml>=6.0
+requests>=2.31
+python-dotenv>=1.0
+pytrends>=4.9
+yfinance>=0.2
+eurostat>=1.0
+fredapi>=0.5
