@@ -21,15 +21,13 @@ yahoo_finance:
 #Lietuva
   "^OMXV":
     name: "OMX Vilnius Index"
-  "APG1L.VL":
+  "APG1L.VS":
     name: "Apranga"
-  "TEL1L.VL":
+  "TEL1L.VS":
     name: "Telia Lietuva"
-  "SAB1L.VL":
-    name: "Šiaulių bankas"
-  "IGN1L.VL":
+  "IGN1L.VS":
     name: "Ignitis grupė"
-  "RSU1L.VL":
+  "RSU1L.VS":
     name: "Rokiškio sūris"
   "^VIX":
     name: "Volatility index"
@@ -37,10 +35,8 @@ yahoo_finance:
     name: "Obligacijos"
   "HYG":
     name: "High Yield Corporate Bond"
-  "^WIG20":
+  "WIG20.WA":
     name: "Lenkijos fondų indeksas"
-  "^BDI":
-    name: "Baltic Dry Index"
   "XLI":
     name: "industrials"
   "XHB":
