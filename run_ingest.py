@@ -1,7 +1,14 @@
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from scripts import load_fredmd, load_alfred, load_eurostat, load_google_trends, load_financials
+from scripts import (
+    load_fredmd,
+    load_alfred,
+    load_eurostat,
+    load_google_trends,
+    load_financials,
+    load_statgov_all_flows,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("IngestionRunner")
@@ -28,18 +35,19 @@ def main(mode: str = "initial"):
         "ALFRED":     lambda: load_alfred.main(mode=mode),
         "Financials": lambda: load_financials.main(mode=mode),
     }
-    with ThreadPoolExecutor(max_workers=3) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         futs = {ex.submit(_run_loader, name, fn): name for name, fn in wave1.items()}
         for fut in as_completed(futs):
-            fut.result()  # exceptions were already logged inside _run_loader
+            fut.result()
 
     # Wave 2: Slow / API-heavy
     logger.info("Wave 2: launching slow loaders in parallel")
     wave2 = {
         "Eurostat":       lambda: load_eurostat.main(mode=mode),
         "Google Trends":  lambda: load_google_trends.main(mode=mode),
+        "StatGov":        lambda: load_statgov_all_flows.main(),
     }
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=3) as ex:
         futs = {ex.submit(_run_loader, name, fn): name for name, fn in wave2.items()}
         for fut in as_completed(futs):
             fut.result()

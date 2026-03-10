@@ -258,25 +258,40 @@ def main(mode: str = "initial", max_workers: int = 4):
             failed_total += 1
             logger.error(f"Ticker failed: {r}")
 
+    # ---- MINIMAL CHANGE HERE: do NOT create a '__run_summary__' dataset ----
+    # Instead, log the run summary against the first configured ticker's dataset.
     with engine.begin() as conn:
         provider_id = ensure_provider(conn, "yahoo_finance", base_url="https://finance.yahoo.com")
-        dataset_id = ensure_dataset(conn, provider_id, key="__run_summary__", title="Yahoo Finance Run Summary")
-        log_ingestion(
-            conn,
-            dataset_id=dataset_id,
-            status="ok" if failed_total == 0 else "ok_with_errors",
-            rows_inserted=inserted_total,
-            rows_failed=failed_total,
-            details={
-                "mode": mode,
-                "downloaded_at": downloaded_at.isoformat(),
-                "vintage_at": vintage_at.isoformat(),
-                "tickers": len(items),
-                "inserted_total_attempted": inserted_total,
-                "skipped_total": skipped_total,
-                "failed_total": failed_total,
-            },
-        )
+
+        if items:
+            first_ticker, first_details = items[0]
+            if isinstance(first_details, dict):
+                first_name = first_details.get("name", first_ticker)
+            else:
+                first_name = str(first_details)
+
+            dataset_id = ensure_dataset(conn, provider_id, key=first_ticker, title=first_name)
+
+            log_ingestion(
+                conn,
+                dataset_id=dataset_id,
+                status="ok" if failed_total == 0 else "ok_with_errors",
+                rows_inserted=inserted_total,
+                rows_failed=failed_total,
+                details={
+                    "mode": mode,
+                    "downloaded_at": downloaded_at.isoformat(),
+                    "vintage_at": vintage_at.isoformat(),
+                    "tickers": len(items),
+                    "inserted_total_attempted": inserted_total,
+                    "skipped_total": skipped_total,
+                    "failed_total": failed_total,
+                    "note": "run summary logged against first ticker dataset; no __run_summary__ dataset created",
+                },
+            )
+        else:
+            logger.warning("No tickers configured; skipping run summary log.")
+    # ---- END MINIMAL CHANGE ----
 
     logger.info(
         f"Yahoo Finance [{mode}] done: inserted_attempted={inserted_total}, skipped={skipped_total}, failed={failed_total}"

@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 import xml.etree.ElementTree as ET
 
-import load_statgov_one_flow as loader
+from scripts import load_statgov_one_flow as loader
 
 logger = logging.getLogger("statgov_all_flows")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -93,13 +93,14 @@ def run_one_flow_with_retry(
     start: Optional[str],
     end: Optional[str],
     debug_title: bool,
+    mode: str,
     retries: int,
     retry_sleep: float,
 ) -> Tuple[str, bool, Optional[str]]:
     last_err = None
     for attempt in range(retries + 1):
         try:
-            loader.ingest_one_flow(flow_id, start=start, end=end, debug_title=debug_title)
+            loader.ingest_one_flow(flow_id, start=start, end=end, debug_title=debug_title, mode=mode)
             return flow_id, True, None
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
@@ -114,6 +115,7 @@ def main() -> None:
     ap.add_argument("--start", default=None)
     ap.add_argument("--end", default=None)
     ap.add_argument("--debug-title", action="store_true")
+    ap.add_argument("--mode", choices=["initial", "update"], default="update")
 
     ap.add_argument("--include", default=None, help="Regex: only ingest flows whose id matches")
     ap.add_argument("--exclude", default=None, help="Regex: skip flows whose id matches")
@@ -173,6 +175,7 @@ def main() -> None:
                 args.start,
                 args.end,
                 args.debug_title,
+                args.mode,
                 args.retries,
                 args.retry_sleep,
             )

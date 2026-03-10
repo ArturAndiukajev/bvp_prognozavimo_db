@@ -713,6 +713,24 @@ def create_release(conn, dataset_id: int, downloaded_at: datetime, vintage_at: d
     return int(r[0])
 
 
+def get_latest_release_info(conn, dataset_id: int) -> tuple[Optional[str], Optional[datetime], Optional[int]]:
+    row = conn.execute(
+        text(
+            """
+        SELECT content_hash, vintage_at, id
+        FROM releases
+        WHERE dataset_id=:did
+        ORDER BY downloaded_at DESC, id DESC
+        LIMIT 1
+        """
+        ),
+        {"did": dataset_id},
+    ).fetchone()
+    if not row:
+        return None, None, None
+    return row[0], row[1], row[2]
+
+
 def ensure_series(
     conn,
     dataset_id: int,
@@ -763,10 +781,14 @@ def ensure_series(
 # ----------------------------
 # Main ingest (ONLY necessary change: freq inference)
 # ----------------------------
-def ingest_one_flow(flow_id: str, start: str | None = None, end: str | None = None, debug_title: bool = False) -> None:
+def ingest_one_flow(
+    flow_id: str,
+    start: str | None = None,
+    end: str | None = None,
+    debug_title: bool = False,
+    mode: str = "update",
+) -> None:
     downloaded_at = datetime.now(timezone.utc).replace(microsecond=0)
-    observed_at = downloaded_at
-    vintage_at = observed_at
 
     ZERO_STATUSES = {"dydis0"}
 
@@ -774,7 +796,40 @@ def ingest_one_flow(flow_id: str, start: str | None = None, end: str | None = No
     sdmx, raw_bytes, payload_hash, chosen_lang = fetch_json_data_en_first(flow_id, start=start, end=end)
 
     struct = sdmx.get("structure") or {}
-    ds0 = (sdmx.get("dataSets") or [{}])[0]  # needed for DS_TIME_FORMAT
+    ds0 = (sdmx.get("dataSets") or [{}])[0]  # needed for DS_TIME_FORMAT + DS_LAST_UPDATE
+
+    def _get_ds_last_update(struct: dict, ds0: dict) -> datetime | None:
+        """Return DS_LAST_UPDATE as UTC datetime if present, else None."""
+        try:
+            for a in ((struct.get("attributes") or {}).get("dataSet") or []):
+                if a.get("id") == "DS_LAST_UPDATE":
+                    vals = a.get("values") or []
+                    if vals and vals[0].get("id"):
+                        s = str(vals[0]["id"]).strip()
+                        if s:
+                            return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+                    break
+        except Exception:
+            pass
+
+        try:
+            ds_attrs = _decode_dataset_attributes(struct, ds0)
+            lu = ds_attrs.get("DS_LAST_UPDATE")
+            if isinstance(lu, dict) and lu.get("id"):
+                s = str(lu["id"]).strip()
+                if s:
+                    return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+
+        return None
+
+    observed_at = _get_ds_last_update(struct, ds0) or downloaded_at
+    vintage_at = observed_at
+
+    logger.info(
+        f"flow={flow_id} downloaded_at={downloaded_at.isoformat()} observed_at={observed_at.isoformat()} lang={chosen_lang} mode={mode}"
+    )
 
     dim_value_labels: Dict[str, Dict[str, str]] = {}
     try:
@@ -830,8 +885,6 @@ def ingest_one_flow(flow_id: str, start: str | None = None, end: str | None = No
 
     time_dim = detect_time_dim(struct, df)
     df["period_date"] = df[time_dim].apply(to_period_date)
-
-    # Infer frequency from DS_TIME_FORMAT dataset attribute, fallback to TIME_PERIOD parsing
     freq = infer_frequency_from_dataset(struct, ds0, df, time_dim)
 
     geo_dim = guess_geo_dim(list(df.columns))
@@ -843,17 +896,8 @@ def ingest_one_flow(flow_id: str, start: str | None = None, end: str | None = No
     dims_for_series = [c for c in df.columns if c not in non_series_cols and c not in obs_attr_ids]
     dim_keys = sorted(dims_for_series)
 
-    raw_dir = os.environ.get("STATGOV_RAW_DIR")
-    raw_path = None
-    if raw_dir:
-        os.makedirs(raw_dir, exist_ok=True)
-        raw_path = os.path.join(raw_dir, f"{flow_id}_{payload_hash}.json")
-        with open(raw_path, "wb") as f:
-            f.write(raw_bytes)
-
     inserted, failed = 0, 0
     series_cache: Dict[tuple, int] = {}
-
     discarded_missing_by_series: Dict[str, Dict[str, int]] = {}
 
     provider_name = "stat_gov"
@@ -874,9 +918,52 @@ def ingest_one_flow(flow_id: str, start: str | None = None, end: str | None = No
         "ds_attrs": _decode_dataset_attributes(struct, ds0),
     }
 
+    raw_dir = os.environ.get("STATGOV_RAW_DIR")
+    raw_path = None
+
     with engine.begin() as conn:
         provider_id = ensure_provider(conn, provider_name, base_url="https://osp-rs.stat.gov.lt/", meta={"api": "osp"})
         dataset_id = ensure_dataset(conn, provider_id, key=flow_id, title=dataset_title, description=dataset_desc, meta=dataset_meta)
+
+        if mode == "update":
+            prev_hash, prev_vintage_at, prev_release_id = get_latest_release_info(conn, dataset_id)
+            if prev_hash == payload_hash:
+                logger.info(
+                    f"flow={flow_id}: no changes detected (hash same as latest release id={prev_release_id}, vintage_at={prev_vintage_at}) -> skip"
+                )
+                conn.execute(
+                    text(
+                        """
+                    INSERT INTO ingestion_log (dataset_id, status, rows_inserted, rows_failed, details)
+                    VALUES (:did, :status, :ins, :fail, CAST(:details AS jsonb))
+                    """
+                    ),
+                    {
+                        "did": dataset_id,
+                        "status": "skipped",
+                        "ins": 0,
+                        "fail": 0,
+                        "details": json.dumps(
+                            {
+                                "flow_id": flow_id,
+                                "mode": mode,
+                                "reason": "content_hash_unchanged",
+                                "payload_hash": payload_hash,
+                                "latest_release_id": prev_release_id,
+                                "latest_vintage_at": prev_vintage_at.isoformat() if prev_vintage_at else None,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                )
+                return
+
+        if raw_dir:
+            os.makedirs(raw_dir, exist_ok=True)
+            raw_path = os.path.join(raw_dir, f"{flow_id}_{payload_hash}.json")
+            with open(raw_path, "wb") as f:
+                f.write(raw_bytes)
+
         release_id = create_release(conn, dataset_id, downloaded_at, vintage_at, payload_hash, raw_path)
 
         for _, row in df.iterrows():
@@ -1017,6 +1104,8 @@ def ingest_one_flow(flow_id: str, start: str | None = None, end: str | None = No
                         "series_count": len(series_cache),
                         "payload_hash": payload_hash,
                         "raw_path": raw_path,
+                        "mode": mode,
+                        "observed_at": observed_at.isoformat(),
                     },
                     ensure_ascii=False,
                 ),
@@ -1040,15 +1129,15 @@ def ingest_one_flow(flow_id: str, start: str | None = None, end: str | None = No
 
     logger.info(f"DONE flow={flow_id} title={dataset_title!r} freq={freq} series={len(series_cache)} inserted={inserted} failed={failed}")
 
-
 def main():
     parser = argparse.ArgumentParser(description="Load one StatGov OSP SDMX flow into nowcast DB")
     parser.add_argument("flow_id", help="Flow id, e.g. S3R002_M3140501")
     parser.add_argument("--start", default=None)
     parser.add_argument("--end", default=None)
     parser.add_argument("--debug-title", action="store_true", help="Print where title/desc were obtained from")
+    parser.add_argument("--mode", choices=["initial", "update"], default="update", help="In update mode, skip unchanged releases by payload hash")
     args = parser.parse_args()
-    ingest_one_flow(args.flow_id, start=args.start, end=args.end, debug_title=args.debug_title)
+    ingest_one_flow(args.flow_id, start=args.start, end=args.end, debug_title=args.debug_title, mode=args.mode)
 
 
 if __name__ == "__main__":

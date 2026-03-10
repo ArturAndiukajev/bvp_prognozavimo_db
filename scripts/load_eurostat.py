@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import eurostat
+import requests
 
 from scripts.db_helpers import (
     get_engine,
@@ -124,9 +125,20 @@ def build_series_key(dataset_code: str, dims: Dict[str, Any], dim_cols: list[str
 
 
 def guess_country(dims: Dict[str, Any]) -> str:
+    # Standard case: Eurostat uses the 'geo' dimension with 2-letter codes.
     for k in ("geo", "GEO"):
         if k in dims and dims[k] is not None:
             return str(dims[k])
+
+    # Some reshaped outputs can produce composite keys like 'geo\\TIME_PERIOD'.
+    # In that case the value is still the country/region code.
+    for k, v in dims.items():
+        if v is None:
+            continue
+        ks = str(k).lower()
+        if ks.startswith("geo\\"):
+            return str(v)
+
     return "EU"
 
 
@@ -141,6 +153,51 @@ def guess_frequency(dims: Dict[str, Any], time_label: Any) -> str:
     return "A"
 
 
+
+def _parse_eurostat_updated_ts(s: str) -> Optional[datetime]:
+    """Parse Eurostat JSON-stat 'updated' timestamps like '2026-03-05T11:00:00+0100'."""
+    if not s:
+        return None
+    s = str(s).strip()
+    # normalize timezone offset +HHMM / -HHMM -> +HH:MM / -HH:MM for fromisoformat
+    m = re.match(r"^(.*)([+-])(\d{2})(\d{2})$", s)
+    if m and ":" not in m.group(2) + m.group(3) + m.group(4):
+        s = f"{m.group(1)}{m.group(2)}{m.group(3)}:{m.group(4)}"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def fetch_dataset_updated(dataset_code: str, *, timeout: int = 30) -> Optional[datetime]:
+    """Fetch JSON-stat for a dataset and return its top-level 'updated' timestamp (UTC)."""
+    base = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data"
+    # Eurostat API supports JSONSTAT/JSONSTAT2 depending on endpoint; try a small fallback list.
+    urls = [
+        f"{base}/{dataset_code}?format=JSONSTAT",
+        f"{base}/{dataset_code}?format=JSONSTAT2",
+        f"{base}/{dataset_code}?format=JSON",
+    ]
+    headers = {"Accept": "application/json"}
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            if r.status_code != 200:
+                continue
+            js = r.json()
+            # JSON-stat top-level 'updated'
+            upd = js.get("updated") if isinstance(js, dict) else None
+            dt = _parse_eurostat_updated_ts(upd)
+            if dt:
+                return dt
+        except Exception:
+            continue
+    return None
+
+
 def fetch_dataset(dataset_code: str) -> pd.DataFrame:
     return eurostat.get_data_df(dataset_code)
 
@@ -150,10 +207,13 @@ def ingest_dataset(dataset_code: str, dataset_cfg: dict, mode: str = "initial"):
     dataset_name = dataset_cfg.get("name", dataset_code) if isinstance(dataset_cfg, dict) else dataset_code
 
     downloaded_at = datetime.now(timezone.utc)
-    vintage_at = downloaded_at
+    # Use Eurostat dataset 'updated' timestamp (vintage) when available
+    vintage_at = fetch_dataset_updated(dataset_code) or downloaded_at
     stamp = downloaded_at.strftime("%Y-%m-%dT%H%M%SZ")
 
-    logger.info(f"[{mode}] Eurostat dataset={dataset_code} filters={filters}")
+    logger.info(
+        f"[{mode}] Eurostat dataset={dataset_code} filters={filters} downloaded_at={downloaded_at.isoformat()} vintage_at={vintage_at.isoformat()}"
+    )
 
     with Timer(f"Eurostat fetch {dataset_code}"):
         try:
@@ -219,7 +279,7 @@ def ingest_dataset(dataset_code: str, dataset_cfg: dict, mode: str = "initial"):
             raw_path=str(raw_path),
             content_hash=content_hash,
             scope=scope,
-            meta={"dataset_code": dataset_code, "dataset_name": dataset_name, "filters": filters, "mode": mode},
+            meta={"dataset_code": dataset_code, "dataset_name": dataset_name, "filters": filters, "mode": mode, "dataset_updated_at": vintage_at.isoformat()},
         )
 
         COPY_BATCH = 200_000
@@ -344,5 +404,42 @@ def main(mode: str = "initial", max_workers: int = 4):
                 logger.error(f"Dataset {code} failed: {e}")
 
 
+
+
+# if __name__ == "__main__":
+#     main(mode="initial", max_workers=4)
+
+
+
 if __name__ == "__main__":
-    main(mode="initial", max_workers=4)
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", default="initial", choices=["initial", "update"])
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--limit", type=int, default=0, help="Ingest only first N datasets (0 = all)")
+    args = ap.parse_args()
+
+    config = load_config()
+    euro_cfg = config.get("eurostat", {}) if isinstance(config, dict) else {}
+    items = list(euro_cfg.items())
+    if args.limit and args.limit > 0:
+        items = items[:args.limit]
+
+    logger.info(f"Eurostat run: mode={args.mode}, datasets={len(items)}, workers={args.workers}")
+
+    if args.workers <= 1:
+        for dataset_code, dataset_cfg in items:
+            ingest_dataset(dataset_code, dataset_cfg or {}, mode=args.mode)
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futures = {
+                ex.submit(ingest_dataset, dataset_code, (dataset_cfg or {}), args.mode): dataset_code
+                for dataset_code, dataset_cfg in items
+            }
+            for fut in as_completed(futures):
+                code = futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    logger.error(f"Dataset {code} failed: {e}")
