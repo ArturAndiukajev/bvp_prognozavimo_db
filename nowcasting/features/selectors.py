@@ -34,6 +34,104 @@ class IdentitySelector(BaseEstimator, TransformerMixin):
         return X
 
 
+class FastScreeningFilter(BaseEstimator, TransformerMixin):
+    """
+    Highly scalable first-pass filter for very large arrays.
+    Filters by:
+      1. Minimum valid observations ratio (completeness_threshold)
+      2. Minimum variance (variance_threshold)
+      3. Top K features by maximum absolute correlation with the target
+         over a specified lag window (max_lag).
+    """
+    def __init__(
+        self,
+        completeness_threshold: float = 0.5,
+        variance_threshold: float = 1e-6,
+        top_k: int = 100,
+        max_lag: int = 3,
+    ):
+        self.completeness_threshold = completeness_threshold
+        self.variance_threshold = variance_threshold
+        self.top_k = top_k
+        self.max_lag = max_lag
+        self.selected_cols_ = None
+
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        if X.empty:
+            self.selected_cols_ = []
+            self.is_fitted_ = True
+            return self
+
+        # 1. Completeness Filter
+        valid_ratio = X.notna().mean()
+        candidate_cols = valid_ratio[valid_ratio >= self.completeness_threshold].index
+
+        if len(candidate_cols) == 0:
+            logger.warning("FastScreeningFilter: no feature met the completeness threshold.")
+            self.selected_cols_ = []
+            self.is_fitted_ = True
+            return self
+
+        X_sub = X[candidate_cols]
+
+        # 2. Variance Filter
+        variances = X_sub.var(skipna=True)
+        candidate_cols = variances[variances >= self.variance_threshold].index
+
+        if len(candidate_cols) == 0:
+            logger.warning("FastScreeningFilter: no feature met the variance threshold.")
+            self.selected_cols_ = []
+            self.is_fitted_ = True
+            return self
+
+        X_sub = X_sub[candidate_cols]
+
+        # 3. Lag-Aware Absolute Correlation
+        # Create shifted targets inside the train sample
+        y_lags = pd.DataFrame({f"lag_{i}": y.shift(i) for i in range(self.max_lag + 1)})
+        y_lags = y_lags.dropna(how="all")
+        
+        common_idx = X_sub.index.intersection(y_lags.index)
+        X_align = X_sub.loc[common_idx]
+        y_align = y_lags.loc[common_idx]
+
+        corrs_max = {}
+        for col in X_align.columns:
+            valid = X_align[col].notna()
+            n_valid = valid.sum()
+            
+            if n_valid > 5:
+                x_val = X_align.loc[valid, col].values
+                y_val = y_align.loc[valid].values
+                
+                best_c = 0.0
+                for lag_idx in range(self.max_lag + 1):
+                    y_l = y_val[:, lag_idx]
+                    v_mask = ~np.isnan(y_l)
+                    if v_mask.sum() > 5:
+                        # Compute safely across remaining valid overlapping items
+                        corr_matrix = np.corrcoef(x_val[v_mask], y_l[v_mask])
+                        if corr_matrix.shape == (2, 2):
+                            c = corr_matrix[0, 1]
+                            if not np.isnan(c) and abs(c) > best_c:
+                                best_c = abs(c)
+                corrs_max[col] = best_c
+            else:
+                corrs_max[col] = 0.0
+
+        corr_s = pd.Series(corrs_max).sort_values(ascending=False)
+        self.selected_cols_ = corr_s.head(self.top_k).index.tolist()
+        
+        logger.info(f"FastScreen: condensed {X.shape[1]} -> {len(candidate_cols)} -> {len(self.selected_cols_)} features.")
+        self.is_fitted_ = True
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        if not self.selected_cols_:
+            return X.iloc[:, :0]  # Return empty keeping index
+        return X[self.selected_cols_].copy()
+
+
 class VarianceFilter(BaseEstimator, TransformerMixin):
     """Removes near-zero variance features."""
     def __init__(self, threshold: float = 1e-6):

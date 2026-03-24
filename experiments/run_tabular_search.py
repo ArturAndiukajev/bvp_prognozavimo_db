@@ -24,7 +24,7 @@ Quick start
         --selectors none,pca --pca-components 3 \\
         --enet-l1-ratios 0.5 --enet-cv 3 \\
         --lgbm-n-estimators 50 --lgbm-learning-rates 0.05 \\
-        --train-windows 80 --search-last-n-steps 3 --seed 42
+        --train-windows 80 --search-last-n-steps 3 --seed 123
 
 Full search
 -----------
@@ -55,7 +55,7 @@ Full search
         --step-sizes 1,3 \\
         --search-last-n-steps 30 \\
         --n-jobs 4 \\
-        --seed 42
+        --seed 123
 """
 
 from __future__ import annotations
@@ -97,6 +97,7 @@ from nowcasting.features.selectors import (
     ElasticNetSelector,
     PCACompressor,
     FactorAnalysisCompressor,
+    FastScreeningFilter,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -145,10 +146,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Comma-separated: elasticnet, lightgbm")
 
     # ---------- Feature selectors ----------
-    ap.add_argument("--selectors", default="none,corr_top_n,pca",
-                    help="none, variance_filter, corr_top_n, lasso, elasticnet, pca, factor_analysis")
+    ap.add_argument("--selectors", default="none,fast_screen,corr_top_n,pca",
+                    help="none, fast_screen, variance_filter, corr_top_n, lasso, elasticnet, pca, factor_analysis")
     ap.add_argument("--variance-thresholds", default="0.0,1e-6")
     ap.add_argument("--top-n",  default="10,20,50")
+    ap.add_argument("--fast-screen-top-k", default="50,100")
     ap.add_argument("--lasso-alphas",  default="0.001,0.01,0.1",
                     help="Alpha values for the Lasso *selector*")
     ap.add_argument("--elasticnet-selector-alphas", default="0.001,0.01",
@@ -182,10 +184,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--step-sizes",    default="1")
     ap.add_argument("--search-last-n-steps", type=int, default=0)
     ap.add_argument("--search-max-configs",  type=int, default=0)
+    ap.add_argument("--search-strategy", type=str, default="full", choices=["full", "staged"])
+    ap.add_argument("--search-top-k", type=int, default=5)
 
     # ---------- Compute ----------
     ap.add_argument("--n-jobs", type=int, default=1)
-    ap.add_argument("--seed",   type=int, default=42)
+    ap.add_argument("--seed",   type=int, default=123)
 
     # ---------- Output ----------
     ap.add_argument("--results-file", default="data/forecasts/tabular_experiment_results.csv")
@@ -220,6 +224,8 @@ def _selector_param_grid(method: str, args: argparse.Namespace) -> List[dict]:
         return [{"n_components": n} for n in _plist(args.pca_components, int)]
     elif method == "factor_analysis":
         return [{"n_components": n} for n in _plist(args.fa_components, int)]
+    elif method == "fast_screen":
+        return [{"top_n": n} for n in _plist(args.fast_screen_top_k, int)]
     return [{}]
 
 
@@ -239,6 +245,8 @@ def build_selector(method: str, params: dict) -> Any:
         return PCACompressor(n_components=params.get("n_components", 5))
     elif method == "factor_analysis":
         return FactorAnalysisCompressor(n_components=params.get("n_components", 5))
+    elif method == "fast_screen":
+        return FastScreeningFilter(top_k=params.get("top_n", 50))
     raise ValueError(f"Unknown selector: {method}")
 
 
@@ -419,8 +427,15 @@ def run_single_experiment(
             res["n_features_used"] = getattr(selector.fa, "n_components", None)
         else:
             res["n_features_used"] = X_panel.shape[1]
+            
+        # Track feature counts seamlessly natively provided by the backtester updates
+        res["n_raw_features"]    = int(eval_df["n_raw_features"].median()) if "n_raw_features" in eval_df else None
+        res["n_trans_features"]  = int(eval_df["n_trans_features"].median()) if "n_trans_features" in eval_df else None
+        res["n_sel_features"]    = int(eval_df["n_sel_features"].median()) if "n_sel_features" in eval_df else None
+        res["n_model_used_vars"] = int(eval_df["n_model_used_features"].median()) if "n_model_used_features" in eval_df else None
 
         res["status"] = "success"
+        res["_eval_df"] = eval_df
 
     except Exception as exc:
         res["status"]       = "failed"
@@ -479,20 +494,57 @@ def main() -> None:
         seed=args.seed,
     )
 
-    if args.n_jobs > 1:
-        results = Parallel(n_jobs=args.n_jobs, verbose=5, prefer="processes")(
-            delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid
-        )
-    else:
-        results = []
-        for i, cfg in enumerate(grid, 1):
-            logger.info(
-                f"[{i}/{len(grid)}]  "
-                f"model={cfg['model']:<11s}  "
-                f"sel={cfg['selector_method']:<16s}  "
-                f"tw={cfg['train_window']}"
+    if args.search_strategy == "staged":
+        logger.info(f"--- Stage 1: Coarse Search ({len(grid)} configs, 3 steps) ---")
+        run_kwargs["search_last_n_steps"] = min(3, args.search_last_n_steps) if args.search_last_n_steps > 0 else 3
+        if args.n_jobs > 1:
+            results_s1 = Parallel(n_jobs=args.n_jobs, verbose=5, prefer="processes")(
+                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid
             )
-            results.append(run_single_experiment(cfg, **run_kwargs))
+        else:
+            results_s1 = []
+            for i, cfg in enumerate(grid, 1):
+                logger.info(f"[{i}/{len(grid)}] Stage 1 Running: {cfg['model']} | {cfg['selector_method']}")
+                results_s1.append(run_single_experiment(cfg, **run_kwargs))
+
+        df_s1 = pd.DataFrame([r for r in results_s1 if r["status"] == "success"])
+        if df_s1.empty:
+            logger.error("Stage 1 failed completely.")
+            return
+
+        df_s1 = df_s1.sort_values("rmse")
+        top_k = min(len(df_s1), args.search_top_k)
+        best_configs = df_s1.head(top_k).to_dict("records")
+
+        logger.info(f"--- Stage 2: Fine Search (Top {top_k} configs, {args.search_last_n_steps} steps) ---")
+        clean_keys = set(grid[0].keys())
+        staged_grid = [{k: v for k, v in cfg.items() if k in clean_keys} for cfg in best_configs]
+        
+        run_kwargs["search_last_n_steps"] = args.search_last_n_steps
+        if args.n_jobs > 1:
+            results = Parallel(n_jobs=args.n_jobs, verbose=5, prefer="processes")(
+                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in staged_grid
+            )
+        else:
+            results = []
+            for i, cfg in enumerate(staged_grid, 1):
+                logger.info(f"[{i}/{len(staged_grid)}] Stage 2 Running: {cfg['model']} | {cfg['selector_method']}")
+                results.append(run_single_experiment(cfg, **run_kwargs))
+    else:
+        if args.n_jobs > 1:
+            results = Parallel(n_jobs=args.n_jobs, verbose=5, prefer="processes")(
+                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid
+            )
+        else:
+            results = []
+            for i, cfg in enumerate(grid, 1):
+                logger.info(
+                    f"[{i}/{len(grid)}]  "
+                    f"model={cfg['model']:<11s}  "
+                    f"sel={cfg['selector_method']:<16s}  "
+                    f"tw={cfg['train_window']}"
+                )
+                results.append(run_single_experiment(cfg, **run_kwargs))
 
     total_time = time.time() - tstart
 
@@ -526,13 +578,26 @@ def main() -> None:
     for model_name in df_res["model"].unique():
         model_df = df_res[df_res["model"] == model_name].copy()
         suffix   = _build_suffix(panel_path, args.seed, model_name)
+
+        model_success = model_df[model_df["status"] == "success"]
+        if not model_success.empty:
+            best_idx = model_success["rmse"].idxmin()
+            best_eval_df = model_df.loc[best_idx, "_eval_df"]
+            preds_path = out_base.parent / f"predictions_{suffix}.csv"
+            best_eval_df.to_csv(preds_path, index=False)
+            logger.info(f"{model_name} best preds → {preds_path}")
+
+        if "_eval_df" in model_df.columns:
+            model_df = model_df.drop(columns=["_eval_df"])
+
         csv_path = out_base.parent / f"gridsearch_{suffix}.csv"
         model_df.to_csv(csv_path, index=False)
         logger.info(f"{model_name} results  → {csv_path}")
 
-        model_success = model_df[model_df["status"] == "success"]
         if not model_success.empty:
             best = model_success.sort_values("rmse").iloc[0].to_dict()
+            if "_eval_df" in best:
+                del best["_eval_df"]
             for jcol in ("selector_params", "model_params"):
                 try:
                     best[jcol] = json.loads(best[jcol])
@@ -544,6 +609,8 @@ def main() -> None:
             logger.info(f"{model_name} best cfg → {best_path}")
 
     # Also write the combined table
+    if "_eval_df" in df_res.columns:
+        df_res = df_res.drop(columns=["_eval_df"])
     df_res.to_csv(out_base, index=False)
     logger.info(f"\nCombined results     → {out_base.absolute()}")
 

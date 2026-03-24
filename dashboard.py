@@ -36,7 +36,12 @@ engine = create_engine(
 # ----------------------------
 # Streamlit config
 # ----------------------------
-st.set_page_config(page_title="Nowcast Dashboard", layout="wide")
+st.markdown("""
+<style>
+    .stDataFrame { border-radius: 8px; overflow: hidden; }
+    .stMetric { padding: 15px; border-radius: 8px; border: 1px solid rgba(128,128,128,0.2); }
+</style>
+""", unsafe_allow_html=True)
 
 
 # ============================================================
@@ -159,21 +164,22 @@ def fetch_observations(
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_health_overview() -> pd.DataFrame:
+    # Optimized to group by provider only to prevent out-of-memory memory crashes on massive dataset counts
     return db_fetch_df("""
         SELECT
             p.name AS provider,
-            d.key  AS dataset,
+            COUNT(DISTINCT d.id)::bigint AS datasets_count,
             COUNT(DISTINCT s.id)::bigint AS series_count,
-            MIN(o.period_date) AS first_obs,
-            MAX(o.period_date) AS last_obs,
-            MAX(il.run_time)   AS last_ingest
+            MIN(o.period_date)  AS first_obs,
+            MAX(o.period_date)  AS last_obs,
+            MAX(il.run_time)    AS last_ingest
         FROM providers p
-        JOIN datasets d ON d.provider_id = p.id
+        LEFT JOIN datasets d ON d.provider_id = p.id
         LEFT JOIN series s ON s.dataset_id = d.id
         LEFT JOIN observations o ON o.series_id = s.id
         LEFT JOIN ingestion_log il ON il.dataset_id = d.id
-        GROUP BY p.name, d.key
-        ORDER BY p.name, d.key
+        GROUP BY p.name
+        ORDER BY p.name
     """)
 
 
@@ -194,13 +200,12 @@ def render_catalog():
     st.caption("Shows everything that exists in DB: providers → datasets → series. Works automatically for new sources.")
 
     providers = fetch_providers()
-    datasets = fetch_datasets(provider_id=None, search="", limit=100000)
+    dataset_cnt = db_fetch_df("SELECT COUNT(*)::bigint AS n FROM datasets")["n"].iloc[0]
+    series_cnt = db_fetch_df("SELECT COUNT(*)::bigint AS n FROM series")["n"].iloc[0]
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Providers", int(len(providers)))
-    c2.metric("Datasets", int(len(datasets)))
-    # series count can be huge; query cheaply:
-    series_cnt = db_fetch_df("SELECT COUNT(*)::bigint AS n FROM series")["n"].iloc[0]
+    c2.metric("Datasets", int(dataset_cnt))
     c3.metric("Series", int(series_cnt))
 
     st.subheader("Providers")
@@ -377,31 +382,178 @@ def render_health():
 
 
 def render_nowcast():
-    st.title("🔮 Nowcast Runner")
-    st.caption("Runs your existing nowcast script and displays its output.")
-    st.info("This tab does NOT implement the model. It just launches your existing pipeline script.")
+    st.title("🧪 Experiment Runner")
+    st.caption("Launch your existing model pipelines directly from the dashboard.")
+    st.info("Pick a search or experiment script and run it. The results will automatically populate the Predictions tab.")
 
-    st.write("Script: `scripts/run_nowcast.py` (called via `py -m scripts.run_nowcast`)")
+    scripts = [
+        "run_tabular_search.py", "run_midas_search.py",
+        "run_bridge_search.py", "run_dfm_experiment.py",
+        "run_bvar_experiment.py", "run_tactis_search.py"
+    ]
+    
+    script_to_run = st.selectbox("Select Model Pipeline:", scripts)
+    fast_mode = st.checkbox("⚡ Fast / Demo Mode", value=True, help="Appends `--search-last-n-steps 3` and `--search-max-configs 2` to avoid hour-long gridsearches.")
 
-    if st.button("Run nowcast pipeline"):
-        with st.spinner("Running nowcast..."):
+    if st.button(f"🚀 Run {script_to_run}"):
+        with st.spinner(f"Running {script_to_run}... (this could take minutes to hours depending on grid size)"):
+            import subprocess
             try:
-                import subprocess
-                result = subprocess.run(
-                    ["py", "-m", "scripts.run_nowcast"],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
+                cmd = ["python", f"scripts/{script_to_run}"]
+                if fast_mode:
+                    cmd.extend(["--search-last-n-steps", "3", "--search-max-configs", "2"])
+                    
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
                 out = (result.stdout or "") + "\n" + (result.stderr or "")
-                st.success("Nowcast finished.")
-                st.code(out)
+                st.success(f"{script_to_run} finished successfully.")
+                with st.expander("View Logs"):
+                    st.code(out)
             except subprocess.CalledProcessError as e:
                 out = (e.stdout or "") + "\n" + (e.stderr or "")
-                st.error("Nowcast failed (non-zero exit code).")
-                st.code(out)
+                st.error(f"{script_to_run} failed (non-zero exit code).")
+                with st.expander("View Error Logs"):
+                    st.code(out)
             except Exception as e:
-                st.error(f"Nowcast failed: {e}")
+                st.error(f"Execution failed: {e}")
+
+
+def render_predictions():
+    st.title("📈 Model Predictions & Leaderboard")
+    st.markdown("Compare the best performing model configurations and track their real-time forecasts against actual data.", unsafe_allow_html=True)
+
+    from pathlib import Path
+    import glob
+    base_dir = Path(".")
+
+    # --- 1. LEADERBOARD ---
+    st.header("🏆 Model Leaderboard")
+    
+    # Sweep entire project for result files, ignoring venvs
+    grid_files = [f for f in base_dir.rglob("*gridsearch_*.csv") if "venv" not in str(f) and ".git" not in str(f)]
+    
+    leaderboard_data = []
+    for fp in grid_files:
+        try:
+            df_g = pd.read_csv(fp)
+            df_g_success = df_g[df_g["status"] == "success"]
+            if not df_g_success.empty:
+                best_idx = df_g_success["rmse"].idxmin()
+                best_row = df_g_success.loc[best_idx]
+                
+                parts = fp.stem.split("_")
+                mname = parts[1] if len(parts) > 1 else fp.stem
+                model_name = str(best_row.get("model", mname)).upper()
+                
+                rmse = best_row.get("rmse", float('nan'))
+                mae = best_row.get("mae", float('nan'))
+                runtime = best_row.get("runtime_sec", float('nan'))
+                
+                leaderboard_data.append({
+                    "Model Rank": model_name,
+                    "RMSE": rmse,
+                    "MAE": mae,
+                    "Runtime (s)": f"{runtime:.1f}" if pd.notnull(runtime) else "N/A",
+                    "Source": fp.name
+                })
+        except Exception:
+            pass
+
+    if leaderboard_data:
+        ldb_df = pd.DataFrame(leaderboard_data).sort_values("RMSE").reset_index(drop=True)
+        ldb_df.index = ldb_df.index + 1
+        
+        cols = st.columns(min(3, len(ldb_df)))
+        for i, col in enumerate(cols):
+            row = ldb_df.iloc[i]
+            col.metric(label=f"🥇 #{i+1}: {row['Model Rank']}", value=f"RMSE: {row['RMSE']:.4f}", delta=f"MAE: {row['MAE']:.4f}", delta_color="off")
+            
+        st.dataframe(ldb_df.style.highlight_min(subset=["RMSE", "MAE"], color="#d4edda"), use_container_width=True)
+    else:
+        st.info("No gridsearch metrics found to build a leaderboard.")
+        st.write("👉 Head over to the **Nowcast** tab to run your first experiment!")
+
+    st.divider()
+
+    # --- 2. FORECAST PLOT ---
+    st.header("📊 Forecast Visualization")
+    pred_files = [f for f in base_dir.rglob("*predictions_*.csv") if "venv" not in str(f) and ".git" not in str(f)]
+    if not pred_files:
+        st.info("No prediction CSVs found.")
+        st.write("👉 Your previous gridsearch metric files were found, but older versions of your pipeline scripts did not save the actual time-series predictions. To see the interactive plot, please generate fresh predictions by running an experiment from the **Experiment Runner** tab.")
+        return
+
+    dfs = []
+    for fp in pred_files:
+        try:
+            df_curr = pd.read_csv(fp)
+            if "Target_Date" in df_curr.columns and "Predicted" in df_curr.columns:
+                if "Model" not in df_curr.columns:
+                    parts = fp.stem.split("_")
+                    mname = parts[1] if len(parts) > 1 else fp.stem
+                    df_curr["Model"] = mname.upper()
+                dfs.append(df_curr)
+        except Exception:
+            pass
+            
+    if not dfs:
+        st.warning("No valid prediction data found.")
+        return
+
+    combined_df = pd.concat(dfs, ignore_index=True)
+    combined_df["Target_Date"] = pd.to_datetime(combined_df["Target_Date"])
+    combined_df = combined_df.sort_values("Target_Date")
+    
+    unique_models = sorted(combined_df["Model"].dropna().unique().tolist())
+    
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        st.markdown("**Filter Models**")
+        selected_models = []
+        for m in unique_models:
+            if st.checkbox(m, value=True):
+                selected_models.append(m)
+                
+    with col2:
+        if not selected_models:
+            st.warning("Select at least one model to display the plot.")
+        elif "Actual" in combined_df.columns and "Predicted" in combined_df.columns:
+            plot_df = combined_df[combined_df["Model"].isin(selected_models)]
+            
+            df_actual = plot_df.drop_duplicates(subset=["Target_Date"])[["Target_Date", "Actual"]].sort_values("Target_Date")
+            
+            fig = px.line(df_actual, x="Target_Date", y="Actual", markers=True)
+            if fig.data:
+                fig.data[0].name = "Actual"
+                # Use a theme-agnostic color for the Actual line, or let plotly decide
+                fig.data[0].line.color = "#888888"
+                fig.data[0].line.width = 3
+            
+            fig_pred = px.line(plot_df.sort_values("Target_Date"), x="Target_Date", y="Predicted", color="Model", markers=True)
+            for trace in fig_pred.data:
+                trace.line.dash = "dot"
+                fig.add_trace(trace)
+                
+            fig.update_layout(
+                hovermode="x unified",
+                title="Actual vs Predicted Macroeconomic Trends",
+                xaxis_title="Target Date",
+                yaxis_title="Value",
+                legend_title="Legend",
+                # Removed plot_bgcolor="white" to support native dark mode
+                xaxis={"showgrid": True, "rangeslider": {"visible": True}},
+                yaxis={"showgrid": True}
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            csv_data = plot_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Merged Predictions CSV",
+                data=csv_data,
+                file_name='merged_predictions.csv',
+                mime='text/csv'
+            )
+        else:
+            st.warning("Columns 'Actual' and 'Predicted' are required for the plot.")
 
 
 # ============================================================
@@ -412,8 +564,8 @@ def main():
 
     page = st.sidebar.radio(
         "Navigate",
-        ["Catalog", "Dataset Explorer", "Series Search", "Health", "Nowcast"],
-        index=1,
+        ["Catalog", "Dataset Explorer", "Series Search", "Health", "Nowcast", "Predictions"],
+        index=5,
     )
 
     # connection hint
@@ -430,6 +582,8 @@ def main():
         render_health()
     elif page == "Nowcast":
         render_nowcast()
+    elif page == "Predictions":
+        render_predictions()
 
 
 if __name__ == "__main__":

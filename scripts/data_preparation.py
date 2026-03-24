@@ -889,12 +889,29 @@ def _log_prep_summary(label: str, total: int, out_valid: dict, report_rows: list
     dropped = total - kept
     
     drop_counts = {}
+    kept_freqs = {}
+    dropped_freqs = {}
+    min_date_str = None
+    max_date_str = None
+
     if report_rows:
         drop_reasons = pd.Series([r.get("dropped_reason") for r in report_rows]).value_counts()
         drop_counts = drop_reasons.to_dict()
         reasons_str = ", ".join(f"{r}={c}" for r, c in drop_reasons.items() if r is not None)
+        
+        kept_freqs = pd.Series([str(r.get("frequency")) for r in report_rows if r.get("dropped_reason") is None]).value_counts().to_dict()
+        dropped_freqs = pd.Series([str(r.get("frequency")) for r in report_rows if r.get("dropped_reason") is not None]).value_counts().to_dict()
     else:
         reasons_str = "n/a"
+
+    if out_valid:
+        try:
+            global_min = min(s.dropna().index.min() for s in out_valid.values() if not s.dropna().empty)
+            global_max = max(s.dropna().index.max() for s in out_valid.values() if not s.dropna().empty)
+            min_date_str = global_min.strftime("%Y-%m-%d")
+            max_date_str = global_max.strftime("%Y-%m-%d")
+        except Exception:
+            pass
 
     transforms = pd.Series([r.get("transform_applied") for r in report_rows if r.get("transform_applied")]).value_counts()
     tx_counts = transforms.to_dict()
@@ -902,6 +919,9 @@ def _log_prep_summary(label: str, total: int, out_valid: dict, report_rows: list
 
     logger.info(
         f"{label} Summary: total={total} | kept={kept} | dropped={dropped}\n"
+        f"  Kept Freqs:   {kept_freqs}\n"
+        f"  Drop Freqs:   {dropped_freqs}\n"
+        f"  Date Bounds:  [{min_date_str}, {max_date_str}]\n"
         f"  Drop reasons: {reasons_str or 'none'}\n"
         f"  Transforms:   {tx_str or 'none'}"
     )
@@ -910,6 +930,10 @@ def _log_prep_summary(label: str, total: int, out_valid: dict, report_rows: list
         "total_series_input": total,
         "kept_series": kept,
         "dropped_series": dropped,
+        "kept_frequencies": kept_freqs,
+        "dropped_frequencies": dropped_freqs,
+        "panel_min_date": min_date_str,
+        "panel_max_date": max_date_str,
         "drop_reasons_breakdown": drop_counts,
         "transformations_applied": tx_counts
     }

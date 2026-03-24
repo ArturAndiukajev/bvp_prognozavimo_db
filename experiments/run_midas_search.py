@@ -25,7 +25,7 @@ Example (quick smoke test):
         --regression-models elasticnet \\
         --train-windows 80 \\
         --search-last-n-steps 3 \\
-        --seed 42
+        --seed 123
 
 Full search:
     python scripts/run_midas_search.py \\
@@ -45,7 +45,7 @@ Full search:
         --step-sizes 1,3 \\
         --search-last-n-steps 30 \\
         --n-jobs 4 \\
-        --seed 42
+        --seed 123
 """
 
 from __future__ import annotations
@@ -89,6 +89,7 @@ from nowcasting.features.selectors import (
     PCACompressor,
     FactorAnalysisCompressor,
     AutoencoderCompressor,
+    FastScreeningFilter,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -149,9 +150,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Target column name / series_id")
 
     # Feature selectors
-    ap.add_argument("--selectors", default="none,corr_top_n,pca",
+    ap.add_argument("--selectors", default="none,fast_screen,corr_top_n,pca",
                     help="Comma-separated selector methods: none, variance_filter, corr_top_n, "
-                         "lasso, elasticnet, pca, factor_analysis, autoencoder")
+                         "lasso, elasticnet, pca, factor_analysis, autoencoder, fast_screen")
     ap.add_argument("--variance-thresholds", default="0.0,1e-6",
                     help="Variance thresholds for variance_filter (comma-separated)")
     ap.add_argument("--top-n",  default="10,20,50",
@@ -168,6 +169,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="FactorAnalysis component counts (comma-separated ints)")
     ap.add_argument("--ae-latent-dims", default="5",
                     help="Autoencoder latent dimensions (comma-separated ints)")
+    ap.add_argument("--fast-screen-top-k", default="50,100",
+                    help="Fast screen top K features (comma-separated ints)")
 
     # MIDAS hyperparameters
     ap.add_argument("--n-lags", default="1,2,3,4",
@@ -196,11 +199,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Only run the last N backtest steps per config (0 = all)")
     ap.add_argument("--search-max-configs", type=int, default=0,
                     help="Randomly sub-sample at most N configs (0 = no limit)")
+    ap.add_argument("--search-strategy", type=str, default="full", choices=["full", "staged"],
+                    help="Use 'staged' for a fast 1-pass coarse search to filter options.")
+    ap.add_argument("--search-top-k", type=int, default=5,
+                    help="Top configs to promote to final pass in staged search.")
 
     # Compute
     ap.add_argument("--n-jobs", type=int, default=1,
                     help="Parallel workers (1 = sequential)")
-    ap.add_argument("--seed", type=int, default=42,
+    ap.add_argument("--seed", type=int, default=123,
                     help="Global random seed")
 
     # Output
@@ -241,6 +248,8 @@ def _selector_param_grid(method: str, args: argparse.Namespace) -> List[dict]:
         return [{"n_components": n} for n in _parse_list(args.fa_components, int)]
     elif method == "autoencoder":
         return [{"latent_dim": d} for d in _parse_list(args.ae_latent_dims, int)]
+    elif method == "fast_screen":
+        return [{"top_n": n} for n in _parse_list(args.fast_screen_top_k, int)]
     else:
         return [{}]
 
@@ -266,6 +275,8 @@ def build_selector(method: str, params: dict) -> Any:
         return FactorAnalysisCompressor(n_components=params.get("n_components", 5))
     elif method == "autoencoder":
         return AutoencoderCompressor(latent_dim=params.get("latent_dim", 5))
+    elif method == "fast_screen":
+        return FastScreeningFilter(top_k=params.get("top_n", 50))
     else:
         raise ValueError(f"Unknown selector method: '{method}'")
 
@@ -430,8 +441,15 @@ def run_single_experiment(
             res["n_features_used"] = getattr(selector.fa, "n_components", None)
         else:
             res["n_features_used"] = X_panel.shape[1]
+            
+        # Track feature counts seamlessly natively provided by the backtester updates
+        res["n_raw_features"]    = int(eval_df["n_raw_features"].median()) if "n_raw_features" in eval_df else None
+        res["n_trans_features"]  = int(eval_df["n_trans_features"].median()) if "n_trans_features" in eval_df else None
+        res["n_sel_features"]    = int(eval_df["n_sel_features"].median()) if "n_sel_features" in eval_df else None
+        res["n_model_used_vars"] = int(eval_df["n_model_used_features"].median()) if "n_model_used_features" in eval_df else None
 
         res["status"] = "success"
+        res["_eval_df"] = eval_df
 
     except Exception as exc:
         res["status"]       = "failed"
@@ -492,21 +510,58 @@ def main() -> None:
         seed=args.seed,
     )
 
-    if args.n_jobs > 1:
-        results = Parallel(n_jobs=args.n_jobs, verbose=5, prefer="processes")(
-            delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid
-        )
-    else:
-        results = []
-        for i, cfg in enumerate(grid, 1):
-            logger.info(
-                f"[{i}/{len(grid)}] "
-                f"sel={cfg['selector_method']:<16s}  "
-                f"reg={cfg['regression_model']:<11s}  "
-                f"lags={cfg['n_lags']}  "
-                f"tw={cfg['train_window']}"
+    if args.search_strategy == "staged":
+        logger.info(f"--- Stage 1: Coarse Search ({len(grid)} configs, 3 steps) ---")
+        run_kwargs["search_last_n_steps"] = min(3, args.search_last_n_steps) if args.search_last_n_steps > 0 else 3
+        if args.n_jobs > 1:
+            results_s1 = Parallel(n_jobs=args.n_jobs, verbose=5, prefer="processes")(
+                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid
             )
-            results.append(run_single_experiment(cfg, **run_kwargs))
+        else:
+            results_s1 = []
+            for i, cfg in enumerate(grid, 1):
+                logger.info(f"[{i}/{len(grid)}] Stage 1 Running: {cfg['selector_method']} | {cfg['regression_model']}")
+                results_s1.append(run_single_experiment(cfg, **run_kwargs))
+
+        df_s1 = pd.DataFrame([r for r in results_s1 if r["status"] == "success"])
+        if df_s1.empty:
+            logger.error("Stage 1 failed completely.")
+            return
+
+        df_s1 = df_s1.sort_values("rmse")
+        top_k = min(len(df_s1), args.search_top_k)
+        best_configs = df_s1.head(top_k).to_dict("records")
+
+        logger.info(f"--- Stage 2: Fine Search (Top {top_k} configs, {args.search_last_n_steps} steps) ---")
+        clean_keys = set(grid[0].keys())
+        staged_grid = [{k: v for k, v in cfg.items() if k in clean_keys} for cfg in best_configs]
+        
+        run_kwargs["search_last_n_steps"] = args.search_last_n_steps
+        if args.n_jobs > 1:
+            results = Parallel(n_jobs=args.n_jobs, verbose=5, prefer="processes")(
+                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in staged_grid
+            )
+        else:
+            results = []
+            for i, cfg in enumerate(staged_grid, 1):
+                logger.info(f"[{i}/{len(staged_grid)}] Stage 2 Running: {cfg['selector_method']} | {cfg['regression_model']}")
+                results.append(run_single_experiment(cfg, **run_kwargs))
+    else:
+        if args.n_jobs > 1:
+            results = Parallel(n_jobs=args.n_jobs, verbose=5, prefer="processes")(
+                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid
+            )
+        else:
+            results = []
+            for i, cfg in enumerate(grid, 1):
+                logger.info(
+                    f"[{i}/{len(grid)}] "
+                    f"sel={cfg['selector_method']:<16s}  "
+                    f"reg={cfg['regression_model']:<11s}  "
+                    f"lags={cfg['n_lags']}  "
+                    f"tw={cfg['train_window']}"
+                )
+                results.append(run_single_experiment(cfg, **run_kwargs))
 
     total_time = time.time() - tstart
 
@@ -539,12 +594,25 @@ def main() -> None:
         print(df_res.head(5)[display_cols].to_string(index=False))
 
     # Always save the full table (includes failed runs for diagnosis)
+    suffix = _build_suffix(panel_path, args.seed)
+    if not success.empty:
+        best_idx = success["rmse"].idxmin()
+        best_eval_df = df_res.loc[best_idx, "_eval_df"]
+        preds_path = out_path.parent / f"predictions_{suffix}.csv"
+        best_eval_df.to_csv(preds_path, index=False)
+        logger.info(f"MIDAS best preds → {preds_path}")
+
+    if "_eval_df" in df_res.columns:
+        df_res = df_res.drop(columns=["_eval_df"])
+
     df_res.to_csv(out_path, index=False)
     logger.info(f"\nDetailed results → {out_path.absolute()}")
 
     # 6. Best configuration JSON
     if not success.empty:
-        best = df_res.iloc[0].to_dict()
+        best = success.sort_values("rmse").iloc[0].to_dict()
+        if "_eval_df" in best:
+            del best["_eval_df"]
         for json_col in ("selector_params", "regression_params"):
             try:
                 best[json_col] = json.loads(best[json_col])

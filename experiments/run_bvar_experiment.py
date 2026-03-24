@@ -16,7 +16,7 @@ Example (quick smoke test):
         --pca-components 5,10 \\
         --train-windows 80,120 \\
         --n-jobs 4 \\
-        --seed 42
+        --seed 123
 
 Full run replacing all defaults:
     python scripts/run_bvar_experiment.py \\
@@ -34,7 +34,7 @@ Full run replacing all defaults:
         --train-windows 60,80,120 \\
         --step-sizes 1,3 \\
         --n-jobs 4 \\
-        --seed 42
+        --seed 123
 """
 
 import argparse
@@ -67,7 +67,7 @@ from nowcasting.models.bvar import BVARNowcast
 
 from nowcasting.features.selectors import (
     IdentitySelector, VarianceFilter, PCACompressor, FactorAnalysisCompressor,
-    LassoSelector, ElasticNetSelector, CorrTopNSelector,
+    LassoSelector, ElasticNetSelector, CorrTopNSelector, FastScreeningFilter
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -103,14 +103,16 @@ def build_experiment_parser() -> argparse.ArgumentParser:
                     help="Maximum variables in the VAR system (dimensionality cap)")
 
     # Feature selectors
-    ap.add_argument("--selectors", type=str, default="none,pca,corr_top_n",
-                    help="Comma-separated: none, pca, corr_top_n, lasso, elasticnet, factor_analysis")
+    ap.add_argument("--selectors", type=str, default="none,fast_screen,pca,corr_top_n",
+                    help="Comma-separated: none, fast_screen, pca, corr_top_n, lasso, elasticnet, factor_analysis")
     ap.add_argument("--pca-components",        type=str, default="3,5,10")
     ap.add_argument("--factor-analysis-components", type=str, default="3,5")
     ap.add_argument("--corr-top-n",            type=str, default="10,20,50")
     ap.add_argument("--lasso-alphas",          type=str, default="0.01,0.1")
     ap.add_argument("--elasticnet-alphas",     type=str, default="0.01,0.1")
     ap.add_argument("--elasticnet-l1-ratios",  type=str, default="0.5")
+    ap.add_argument("--fast-screen-top-k",     type=str, default="50,100")
+
 
     # Training settings
     ap.add_argument("--train-windows", type=str, default="60,80,120",
@@ -123,10 +125,14 @@ def build_experiment_parser() -> argparse.ArgumentParser:
                     help="Only run the last N backtest steps (0 = all).")
     ap.add_argument("--search-max-configs",  type=int, default=0,
                     help="Randomly sub-sample at most this many configs (0 = no limit).")
+    ap.add_argument("--search-strategy", type=str, default="full", choices=["full", "staged"],
+                    help="Use 'staged' for a fast 1-pass coarse search to filter options.")
+    ap.add_argument("--search-top-k", type=int, default=5,
+                    help="Top configs to promote to final pass in staged search.")
 
     # Compute
     ap.add_argument("--n-jobs", type=int, default=1)
-    ap.add_argument("--seed",   type=int, default=42,
+    ap.add_argument("--seed",   type=int, default=123,
                     help="Global random seed for reproducibility.")
 
     # Output
@@ -159,6 +165,8 @@ def build_selector(method: str, params: dict):
                                   l1_ratio=params.get("l1_ratio", 0.5))
     elif method == "corr_top_n":
         return CorrTopNSelector(top_n=params.get("top_n", 20))
+    elif method == "fast_screen":
+        return FastScreeningFilter(top_k=params.get("top_n", 50))
     else:
         raise ValueError(f"Unknown selector method: '{method}'")
 
@@ -206,6 +214,9 @@ def generate_experiment_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                     for a in parse_list(args.elasticnet_alphas, float)
                     for l in parse_list(args.elasticnet_l1_ratios, float)
                 ]
+            elif sel == "fast_screen":
+                param_variations = [{"top_n": n}
+                                    for n in parse_list(args.fast_screen_top_k, int)]
 
             for p_var in param_variations:
                 for (l1, l2, l3) in prior_combos:
@@ -323,7 +334,15 @@ def run_single_experiment(
         res["mape"]          = float(metrics["MAPE"].iloc[0]) if "MAPE" in metrics.columns else float("nan")
         res["n_eval_points"] = len(eval_df)
         res["n_folds"]       = eval_df["Forecast_Origin"].nunique() if "Forecast_Origin" in eval_df.columns else len(eval_df)
+        
+        # Track feature counts seamlessly natively provided by the backtester updates
+        res["n_raw_features"]    = int(eval_df["n_raw_features"].median()) if "n_raw_features" in eval_df else None
+        res["n_trans_features"]  = int(eval_df["n_trans_features"].median()) if "n_trans_features" in eval_df else None
+        res["n_sel_features"]    = int(eval_df["n_sel_features"].median()) if "n_sel_features" in eval_df else None
+        res["n_model_used_vars"] = int(eval_df["n_model_used_features"].median()) if "n_model_used_features" in eval_df else None
+        
         res["status"]        = "success"
+        res["_eval_df"]      = eval_df
 
     except Exception as exc:
         logger.warning(f"Experiment failed: {config} → {exc}")
@@ -374,17 +393,48 @@ def main() -> None:
         seed=args.seed,
     )
 
-    if args.n_jobs > 1:
-        results = Parallel(n_jobs=args.n_jobs, verbose=5)(
-            delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid
-        )
+    if args.search_strategy == "staged":
+        logger.info(f"--- Stage 1: Coarse Search ({len(grid)} configs, 3 steps) ---")
+        run_kwargs["search_last_n_steps"] = min(3, args.search_last_n_steps) if args.search_last_n_steps > 0 else 3
+        if args.n_jobs > 1:
+            results_s1 = Parallel(n_jobs=args.n_jobs, verbose=5)(
+                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid
+            )
+        else:
+            results_s1 = [run_single_experiment(cfg, **run_kwargs) for cfg in grid]
+
+        df_s1 = pd.DataFrame([r for r in results_s1 if r["status"] == "success"])
+        if df_s1.empty:
+            logger.error("Stage 1 failed completely.")
+            return
+
+        df_s1 = df_s1.sort_values("rmse")
+        top_k = min(len(df_s1), args.search_top_k)
+        best_configs = df_s1.head(top_k).to_dict("records")
+
+        logger.info(f"--- Stage 2: Fine Search (Top {top_k} configs, {args.search_last_n_steps} steps) ---")
+        clean_keys = set(grid[0].keys())
+        staged_grid = [{k: v for k, v in cfg.items() if k in clean_keys} for cfg in best_configs]
+        
+        run_kwargs["search_last_n_steps"] = args.search_last_n_steps
+        if args.n_jobs > 1:
+            results = Parallel(n_jobs=args.n_jobs, verbose=5)(
+                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in staged_grid
+            )
+        else:
+            results = [run_single_experiment(cfg, **run_kwargs) for cfg in staged_grid]
     else:
-        results = []
-        for i, cfg in enumerate(grid, 1):
-            logger.info(f"[{i}/{len(grid)}] mode={cfg['mode']:4s}  lags={cfg['lags']}"
-                        f"  l1={cfg['lambda1']}  sel={cfg['selector_method']}"
-                        f"  tw={cfg['train_window']}")
-            results.append(run_single_experiment(cfg, **run_kwargs))
+        if args.n_jobs > 1:
+            results = Parallel(n_jobs=args.n_jobs, verbose=5)(
+                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid
+            )
+        else:
+            results = []
+            for i, cfg in enumerate(grid, 1):
+                logger.info(f"[{i}/{len(grid)}] mode={cfg['mode']:4s}  lags={cfg['lags']}"
+                            f"  l1={cfg['lambda1']}  sel={cfg['selector_method']}"
+                            f"  tw={cfg['train_window']}")
+                results.append(run_single_experiment(cfg, **run_kwargs))
 
     total_time = time.time() - tstart
 
@@ -410,11 +460,22 @@ def main() -> None:
                         if c in df_res.columns]
         print(df_res.head(5)[display_cols].to_string(index=False))
 
+        best_idx = success["rmse"].idxmin()
+        best_eval_df = df_res.loc[best_idx, "_eval_df"]
+        preds_path = out_path.parent / f"predictions_bvar_{args.seed}.csv"
+        best_eval_df.to_csv(preds_path, index=False)
+        logger.info(f"BVAR best preds → {preds_path}")
+
+        if "_eval_df" in df_res.columns:
+            df_res = df_res.drop(columns=["_eval_df"])
+
         df_res.to_csv(out_path, index=False)
         logger.info(f"\nDetailed results saved to: {out_path.absolute()}")
 
         # Best configuration JSON
         best = df_res.iloc[0].to_dict()
+        if "_eval_df" in best:
+            del best["_eval_df"]
         try:
             best["selector_params"] = json.loads(best["selector_params"])
         except Exception:
@@ -425,6 +486,8 @@ def main() -> None:
         logger.info(f"Best configuration saved to: {best_path}")
     else:
         logger.error("ALL experiments failed. Saving failure log.")
+        if "_eval_df" in df_res.columns:
+            df_res = df_res.drop(columns=["_eval_df"])
         df_res.to_csv(out_path, index=False)
 
 

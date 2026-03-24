@@ -122,9 +122,16 @@ class RollingBacktester:
             else:
                 train_start = 0
 
-            X_train = X_panel.iloc[train_start:train_end].copy()
+            X_train_orig = X_panel.iloc[train_start:train_end].copy()
             y_train = y_target.iloc[train_start:train_end].copy()
-            X_test = X_panel.iloc[train_end:test_end].copy()
+            X_test_orig = X_panel.iloc[train_end:test_end].copy()
+            
+            X_train = X_train_orig
+            X_test = X_test_orig
+            
+            n_raw_features = X_train.shape[1]
+            n_trans_features = n_raw_features
+            n_sel_features = n_raw_features
             
             forecast_origin = X_train.index[-1] if not X_train.empty else pd.NaT
 
@@ -144,6 +151,7 @@ class RollingBacktester:
                     step_trans.fit(X_train, y_train)
                     X_train = step_trans.transform(X_train)
                     X_test = step_trans.transform(X_test)
+                    n_trans_features = X_train.shape[1]
                 except Exception as e:
                     logger.warning(f"  step t={t}: transformer failed: {e}")
 
@@ -154,6 +162,7 @@ class RollingBacktester:
                     step_sel.fit(X_train, y_train)
                     X_train = step_sel.transform(X_train)
                     X_test = step_sel.transform(X_test)
+                    n_sel_features = X_train.shape[1]
                 except Exception as e:
                     logger.warning(f"  step t={t}: feature_selector failed: {e}")
 
@@ -163,17 +172,34 @@ class RollingBacktester:
                 preds = model.predict(X_test)
                 
                 if isinstance(preds, pd.DataFrame):
-                    if self.eval_mode == "common_frequency" and not preds.index.equals(X_test.index):
-                        preds = preds.reindex(X_test.index)
+                    if self.eval_mode == "common_frequency":
+                        if not preds.index.equals(X_test.index):
+                            preds = preds.reindex(X_test.index)
+                    else:
+                        # Contract enforcement: Mixed-frequency mode must use the target horizon indices explicitly defined by the model
+                        if preds.empty:
+                            logger.warning(f"  step t={t}: mixed-frequency prediction returned empty DataFrame.")
                     preds_df = preds.rename(columns={preds.columns[0]: "Predicted"})
                 else:
-                    if self.eval_mode == "common_frequency" and not preds.index.equals(X_test.index):
-                        preds = preds.reindex(X_test.index)
+                    if self.eval_mode == "common_frequency":
+                        if not preds.index.equals(X_test.index):
+                            preds = preds.reindex(X_test.index)
+                    else:
+                        if preds.empty:
+                            logger.warning(f"  step t={t}: mixed-frequency prediction returned empty Series.")
                     preds_df = preds.to_frame(name="Predicted")
                 
                 preds_df["Target_Date"] = preds_df.index
                 preds_df["Forecast_Origin"] = forecast_origin
                 preds_df["Model"] = model.__class__.__name__
+                preds_df["Prediction_Type"] = getattr(model, "prediction_type", "conditional_nowcast")
+                preds_df["n_raw_features"] = n_raw_features
+                preds_df["n_trans_features"] = n_trans_features
+                preds_df["n_sel_features"] = n_sel_features
+                if hasattr(model, "n_features_seen_"):
+                    preds_df["n_model_used_features"] = model.n_features_seen_
+                else:
+                    preds_df["n_model_used_features"] = n_sel_features
                 
                 out_preds.append(preds_df)
                 n_steps_run += 1
@@ -211,7 +237,7 @@ class RollingBacktester:
         combined_preds["Actual"] = combined_preds["Target_Date"].map(y_target)
         
         # Reorder and filter columns for evaluation
-        cols = ["Forecast_Origin", "Target_Date", "Model", "Actual", "Predicted"]
+        cols = ["Forecast_Origin", "Target_Date", "Model", "Prediction_Type", "Actual", "Predicted"]
         eval_df = combined_preds[cols].sort_values(by=["Forecast_Origin", "Target_Date"]).reset_index(drop=True)
         
         return eval_df

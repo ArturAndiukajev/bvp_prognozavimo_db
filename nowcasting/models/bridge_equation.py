@@ -161,7 +161,7 @@ class BridgeEquationNowcast(BaseNowcastModel):
         self.scaler = StandardScaler()
         
         # Pull seed from kwargs (passed from experiment runner or main.py)
-        seed = kwargs.get("random_state", kwargs.get("seed", 42))
+        seed = kwargs.get("random_state", kwargs.get("seed", 123))
         
         # Build regression model
         if self.regression_model_type == "linear":

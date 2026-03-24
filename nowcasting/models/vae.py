@@ -153,7 +153,7 @@ class VAENowcast(BaseNowcastModel):
         self.device     = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         self.scaler  = StandardScaler()
-        self.reg     = ElasticNetCV(cv=5, random_state=42, max_iter=3000)
+        self.reg     = ElasticNetCV(cv=5, random_state=123, max_iter=3000)
         self.vae_net: Optional[_VAENet] = None
 
     # ------------------------------------------------------------------

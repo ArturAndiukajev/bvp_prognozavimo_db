@@ -12,6 +12,7 @@ class BaseNowcastModel(abc.ABC):
         self.horizon = horizon
         self.params = kwargs
         self.is_fitted = False
+        self.prediction_type = "conditional_nowcast"  # Default expectation
 
     def _validate_inputs(self, X: pd.DataFrame, y: pd.Series = None) -> None:
         """

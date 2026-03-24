@@ -1,14 +1,16 @@
 """
-run_dfm_experiment.py - DFM Grid Search & Feature Selection Experiment Pipeline
-=============================================================================
+run_bridge_search.py - Bridge Equation Grid Search & Feature Selection Experiment Pipeline
+========================================================================================
 
-Executes a grid search over DFM hyperparameters and feature selection
-strategies. Parallelizes outer loops to speed up backtesting. Resulting
-combinations are sorted by RMSE/MAE and exported to CSV.
+Executes a grid search over Bridge Equation hyperparameters, regression models, 
+and feature selection strategies. Parallelizes outer loops to speed up backtesting. 
+Resulting combinations are sorted by RMSE/MAE and exported to CSV.
 
 Example:
-    python scripts/run_dfm_experiment.py --selectors none,pca,lasso,elasticnet \
-           --dfm-k-factors 1,2,3 \
+    python scripts/run_bridge_search.py --selectors none,pca,lasso,elasticnet \
+           --ar-lags 1,2,3 \
+           --agg-rules mean,last \
+           --regression-models linear,ridge,lasso,elasticnet \
            --pca-components 3,5 \
            --lasso-alphas 0.05,0.1 \
            --n-jobs 4 --search-mode quick
@@ -32,23 +34,26 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 # We import pipeline bits from nowcasting package
 from nowcasting.main import build_arg_parser as build_main_parser, load_cf_panel, _DEFAULT_DATA_DIR
 from nowcasting.evaluation.backtester import RollingBacktester
 from nowcasting.evaluation.metrics import compute_metrics
-from nowcasting.models.dfm import DynamicFactorNowcast
+from nowcasting.models.bridge_equation import BridgeEquationNowcast
 
 from nowcasting.features.selectors import (
     IdentitySelector, VarianceFilter, PCACompressor, FactorAnalysisCompressor,
-    LassoSelector, ElasticNetSelector, CorrTopNSelector, AutoencoderCompressor
+    LassoSelector, ElasticNetSelector, CorrTopNSelector, AutoencoderCompressor, FastScreeningFilter
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("dfm_experiment")
+logger = logging.getLogger("bridge_experiment")
 
 
 def build_experiment_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="DFM Feature Selection Experiment Runner")
+    ap = argparse.ArgumentParser(description="Bridge Feature Selection Experiment Runner")
     
     # Data arguments 
     ap.add_argument("--data-dir", type=str, default=_DEFAULT_DATA_DIR)
@@ -56,12 +61,15 @@ def build_experiment_parser() -> argparse.ArgumentParser:
     ap.add_argument("--input-panel", type=str, default=None)
     
     # Grid Search Spaces (Comma-separated lists)
-    ap.add_argument("--selectors", type=str, default="none,pca,lasso,elasticnet,corr_top_n",
-                    help="Comma-separated selectors to test: none,pca,lasso,elasticnet,corr_top_n,factor_analysis,autoencoder")
+    ap.add_argument("--selectors", type=str, default="none,fast_screen,pca,lasso,elasticnet,corr_top_n",
+                    help="Comma-separated selectors to test: none,fast_screen,pca,lasso,elasticnet,corr_top_n,factor_analysis,autoencoder")
     
-    ap.add_argument("--dfm-k-factors", type=str, default="1,2,3")
-    ap.add_argument("--dfm-factor-orders", type=str, default="1,2")
+    # Bridge specific
+    ap.add_argument("--ar-lags", type=str, default="1,2,3")
+    ap.add_argument("--agg-rules", type=str, default="mean,last,sum")
+    ap.add_argument("--regression-models", type=str, default="linear,ridge,lasso,elasticnet")
     
+    # Feature selector hyperparams
     ap.add_argument("--pca-components", type=str, default="3,5,10")
     ap.add_argument("--factor-analysis-components", type=str, default="3,5")
     ap.add_argument("--lasso-alphas", type=str, default="0.01,0.1")
@@ -69,6 +77,7 @@ def build_experiment_parser() -> argparse.ArgumentParser:
     ap.add_argument("--elasticnet-l1-ratios", type=str, default="0.5")
     ap.add_argument("--corr-top-n", type=str, default="10,20,50")
     ap.add_argument("--ae-latent-dims", type=str, default="3,5")
+    ap.add_argument("--fast-screen-top-k", type=str, default="50,100")
 
     # Time rules
     ap.add_argument("--train-windows", type=str, default="120", 
@@ -83,16 +92,21 @@ def build_experiment_parser() -> argparse.ArgumentParser:
                     help="Only run the backtest for the last N steps to save time.")
     ap.add_argument("--search-max-configs", type=int, default=0,
                     help="Limit the number of random configurations tested.")
+    ap.add_argument("--search-strategy", type=str, default="full", choices=["full", "staged"],
+                    help="Use 'staged' for a fast 1-pass coarse search to filter options.")
+    ap.add_argument("--search-top-k", type=int, default=5,
+                    help="Top configs to promote to final pass in staged search.")
     ap.add_argument("--n-jobs", type=int, default=1,
                     help="Number of parallel workers for joblib.")
     
-    ap.add_argument("--out-file", type=str, default="data/forecasts/dfm_experiment_results.csv")
+    ap.add_argument("--out-file", type=str, default="data/forecasts/bridge_search_results.csv")
 
     return ap
 
 
-def parse_list(val_str: str, dtype=int):
+def parse_list(val_str: str, dtype=str):
     return [dtype(v.strip()) for v in val_str.split(",") if v.strip()]
+
 
 def build_selector(method: str, params: dict):
     if method == "none":
@@ -109,6 +123,8 @@ def build_selector(method: str, params: dict):
         return CorrTopNSelector(top_n=params.get("top_n", 20))
     elif method == "autoencoder":
         return AutoencoderCompressor(latent_dim=params.get("latent_dim", 5), epochs=10)
+    elif method == "fast_screen":
+        return FastScreeningFilter(top_k=params.get("top_n", 50))
     else:
         raise ValueError(f"Unknown selector method: {method}")
 
@@ -124,7 +140,7 @@ def run_single_experiment(
     res = {**config}
     res["status"] = "running"
     res["window_type"] = "expanding"
-    res["eval_mode"] = "common_frequency"
+    res["eval_mode"] = "mixed_frequency"
     res["n_folds"] = None
     
     try:
@@ -143,27 +159,33 @@ def run_single_experiment(
             initial_train_periods=init_train, 
             step_size=step_sz,
             window_type="expanding",
-            eval_mode="common_frequency"
+            eval_mode="mixed_frequency"
         )
 
         
         # 2. Selector Initialization
-        # VarianceFilter is always implicitly added in front to drop constants safely
         from sklearn.pipeline import make_pipeline
         base_sel = build_selector(config["selector_method"], config["selector_params"])
         selector = make_pipeline(VarianceFilter(), base_sel)
         
         # 3. Model Initialization
-        k = config["dfm_k_factors"]
-        fo = config["dfm_factor_order"]
+        lags = config["ar_lags"]
+        rule = config["agg_rule"]
+        reg_model = config["regression_model"]
+        
         mod_kws = {}
-        if search_mode == "quick":
-            mod_kws["maxiter"] = 50  # Faster, lower tolerance DFM fits
+        if search_mode == "quick" and reg_model in ["lasso", "elasticnet"]:
+            mod_kws["max_iter"] = 1000  # Faster fits for quick mode
             
-        model = DynamicFactorNowcast(target_col=str(y_target.name), k_factors=k, factor_order=fo, **mod_kws)
+        model = BridgeEquationNowcast(
+            target_col=str(y_target.name), 
+            ar_lags=lags, 
+            agg_rule=rule,
+            regression_model=reg_model,
+            regression_kwargs=mod_kws
+        )
         
         # 4. Run loop
-        # We temporarily disable internal statsmodels progress output inside parallel steps
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -171,7 +193,7 @@ def run_single_experiment(
                 model=model,
                 X_panel=X_panel,
                 y_target=y_target,
-                transformer=None,  # Not used, but could add feature engineering here
+                transformer=None,
                 feature_selector=selector
             )
             
@@ -183,17 +205,18 @@ def run_single_experiment(
             res["error_message"] = "Backtester returned empty DataFrame"
             return res
             
-        # Extract metadata counts from final pipeline state if available
-        # Actually, extracting feature counts from backtester is hard since pipeline is fit internally per step. 
-        # But we can approximate using final model features
-        metrics = compute_metrics(eval_df, model_name=f"DFM_{k}f")
         res["rmse"] = metrics["RMSE"].iloc[0]
         res["mae"] = metrics["MAE"].iloc[0]
         res["status"] = "success"
+        res["_eval_df"] = eval_df
         res["n_eval_points"] = len(eval_df)
         res["n_folds"]       = eval_df["Forecast_Origin"].nunique() if "Forecast_Origin" in eval_df.columns else len(eval_df)
-
         
+        # Track feature counts seamlessly natively provided by the backtester updates
+        res["n_raw_features"]    = int(eval_df["n_raw_features"].median()) if "n_raw_features" in eval_df else None
+        res["n_trans_features"]  = int(eval_df["n_trans_features"].median()) if "n_trans_features" in eval_df else None
+        res["n_sel_features"]    = int(eval_df["n_sel_features"].median()) if "n_sel_features" in eval_df else None
+        res["n_model_used_vars"] = int(eval_df["n_model_used_features"].median()) if "n_model_used_features" in eval_df else None
     except Exception as e:
         logger.warning(f"Experiment failed: {config} -> {e}")
         res["status"] = "failed"
@@ -203,16 +226,17 @@ def run_single_experiment(
 
 
 def generate_experiment_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
-    selectors_to_run = [s.strip() for s in args.selectors.split(",")]
+    selectors_to_run = parse_list(args.selectors, str)
     
-    k_factors = parse_list(args.dfm_k_factors, int)
-    factor_orders = parse_list(args.dfm_factor_orders, int)
+    ar_lags_list = parse_list(args.ar_lags, int)
+    agg_rules = parse_list(args.agg_rules, str)
+    regression_models = parse_list(args.regression_models, str)
+    
     train_windows = parse_list(args.train_windows, int)
     step_sizes = parse_list(args.step_sizes, int)
     
     grids = []
     
-    # We iterate selectors, then build their param variations
     for sel in selectors_to_run:
         param_variations = [{}]
         
@@ -232,15 +256,19 @@ def generate_experiment_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
             param_variations = [{"top_n": n} for n in parse_list(args.corr_top_n, int)]
         elif sel == "autoencoder":
             param_variations = [{"latent_dim": n} for n in parse_list(args.ae_latent_dims, int)]
+        elif sel == "fast_screen":
+            param_variations = [{"top_n": n} for n in parse_list(args.fast_screen_top_k, int)]
             
         for p_var in param_variations:
-            # Cartesian with DFM params
-            for (k, fo, tw, sz) in itertools.product(k_factors, factor_orders, train_windows, step_sizes):
+            for (lags, agg, reg_m, tw, sz) in itertools.product(
+                ar_lags_list, agg_rules, regression_models, train_windows, step_sizes
+            ):
                 grids.append({
                     "selector_method": sel,
                     "selector_params": p_var,
-                    "dfm_k_factors": k,
-                    "dfm_factor_order": fo,
+                    "ar_lags": lags,
+                    "agg_rule": agg,
+                    "regression_model": reg_m,
                     "train_window": tw,
                     "step_size": sz
                 })
@@ -257,16 +285,14 @@ def main():
     ap = build_experiment_parser()
     args = ap.parse_args()
     
-    logger.info("=== DFM Experiment Search Runner ===")
+    logger.info("=== Bridge Equation Experiment Search Runner ===")
     
-    # 1. Load Data
     data_dir = Path(args.data_dir)
     logger.info(f"Loading panel ...")
     X_panel, y_target = load_cf_panel(data_dir, args.target, panel_arg=args.input_panel)
     
     logger.info(f"Panel shape: {X_panel.shape}, Target shape: {y_target.shape}")
     
-    # 2. Build Grid
     grid = generate_experiment_grid(args)
     logger.info(f"Generated {len(grid)} experiment configurations.")
     
@@ -274,7 +300,6 @@ def main():
         logger.warning("Empty grid. Exiting.")
         return
 
-    # 3. Parallel Execution
     logger.info(f"Running experiments (n_jobs={args.n_jobs}, mode={args.search_mode}) ...")
     tstart = time.time()
     
@@ -285,22 +310,56 @@ def main():
         "search_last_n_steps": args.search_last_n_steps
     }
     
-    if args.n_jobs > 1:
-        # Joblib inner executor
-        results = Parallel(n_jobs=args.n_jobs, verbose=10)(
-            delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid
-        )
+    if args.search_strategy == "staged":
+        logger.info(f"--- Stage 1: Coarse Search ({len(grid)} configs, 3 steps) ---")
+        run_kwargs["search_last_n_steps"] = min(3, args.search_last_n_steps) if args.search_last_n_steps > 0 else 3
+        if args.n_jobs > 1:
+            results_s1 = Parallel(n_jobs=args.n_jobs, verbose=10)(
+                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid
+            )
+        else:
+            results_s1 = []
+            for i, cfg in enumerate(grid, 1):
+                logger.info(f"[{i}/{len(grid)}] Stage 1 Running: {cfg}")
+                results_s1.append(run_single_experiment(cfg, **run_kwargs))
+
+        df_s1 = pd.DataFrame([r for r in results_s1 if r["status"] == "success"])
+        if df_s1.empty:
+            logger.error("Stage 1 failed completely.")
+            return
+
+        df_s1 = df_s1.sort_values("rmse")
+        top_k = min(len(df_s1), args.search_top_k)
+        best_configs = df_s1.head(top_k).to_dict("records")
+
+        logger.info(f"--- Stage 2: Fine Search (Top {top_k} configs, {args.search_last_n_steps} steps) ---")
+        clean_keys = set(grid[0].keys())
+        staged_grid = [{k: v for k, v in cfg.items() if k in clean_keys} for cfg in best_configs]
+        
+        run_kwargs["search_last_n_steps"] = args.search_last_n_steps
+        if args.n_jobs > 1:
+            results = Parallel(n_jobs=args.n_jobs, verbose=10)(
+                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in staged_grid
+            )
+        else:
+            results = []
+            for i, cfg in enumerate(staged_grid, 1):
+                logger.info(f"[{i}/{len(staged_grid)}] Stage 2 Running: {cfg}")
+                results.append(run_single_experiment(cfg, **run_kwargs))
     else:
-        results = []
-        for i, cfg in enumerate(grid, 1):
-            logger.info(f"[{i}/{len(grid)}] Running: {cfg}")
-            results.append(run_single_experiment(cfg, **run_kwargs))
+        if args.n_jobs > 1:
+            results = Parallel(n_jobs=args.n_jobs, verbose=10)(
+                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid
+            )
+        else:
+            results = []
+            for i, cfg in enumerate(grid, 1):
+                logger.info(f"[{i}/{len(grid)}] Running: {cfg}")
+                results.append(run_single_experiment(cfg, **run_kwargs))
             
-    # 4. Collect and save results
     total_time = time.time() - tstart
     df_res = pd.DataFrame(results)
     
-    # Format the dict columns for CSV readability
     df_res['selector_params'] = df_res['selector_params'].apply(lambda x: json.dumps(x))
     
     success = df_res[df_res["status"] == "success"]
@@ -313,16 +372,43 @@ def main():
         logger.info(f"Success: {len(success)}, Failed: {failed_count}")
         logger.info("\n--- Top 5 Configurations by RMSE ---")
         
-        print(df_res.head(5)[["selector_method", "selector_params", "dfm_k_factors", "train_window", "rmse", "mae", "runtime_sec"]].to_string())
+        print(df_res.head(5)[["selector_method", "selector_params", "ar_lags", "agg_rule", "regression_model", "rmse", "mae", "runtime_sec"]].to_string())
         
         out_path = Path(args.out_file)
         out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        best_idx = success["rmse"].idxmin()
+        best_eval_df = df_res.loc[best_idx, "_eval_df"]
+        preds_path = out_path.parent / f"predictions_bridge_{args.seed}.csv"
+        best_eval_df.to_csv(preds_path, index=False)
+        logger.info(f"Bridge best preds → {preds_path}")
+
+        if "_eval_df" in df_res.columns:
+            df_res = df_res.drop(columns=["_eval_df"])
+
         df_res.to_csv(out_path, index=False)
         logger.info(f"\nDetailed results saved to {out_path.absolute()}")
+        
+        # Save best configuration to JSON
+        best_config = df_res.iloc[0].to_dict()
+        if "_eval_df" in best_config:
+            del best_config["_eval_df"]
+        import ast
+        try:
+            best_config['selector_params'] = ast.literal_eval(best_config['selector_params'])
+        except:
+            pass
+            
+        best_cfg_path = out_path.parent / "best_bridge_configuration.json"
+        with open(best_cfg_path, "w") as f:
+            json.dump(best_config, f, indent=4)
+        logger.info(f"Best configuration saved to {best_cfg_path}")
     else:
         logger.error("ALL experiments failed. Check logs.")
         out_path = Path(args.out_file)
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        if "_eval_df" in df_res.columns:
+            df_res = df_res.drop(columns=["_eval_df"])
         df_res.to_csv(out_path, index=False)
 
 if __name__ == "__main__":

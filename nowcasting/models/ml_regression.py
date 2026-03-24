@@ -41,7 +41,7 @@ class ElasticNetNowcast(BaseNowcastModel):
         **kwargs,
     ):
         super().__init__(target_col, horizon, **kwargs)
-        seed = kwargs.get("random_state", kwargs.get("seed", 42))
+        seed = kwargs.get("random_state", kwargs.get("seed", 123))
         self.fill_strategy = fill_strategy
         _l1 = l1_ratio if l1_ratio is not None else [0.1, 0.5, 0.7, 0.9, 0.95, 1.0]
         
@@ -101,7 +101,7 @@ class LightGBMNowcast(BaseNowcastModel):
         **kwargs,
     ):
         super().__init__(target_col, horizon, **kwargs)
-        seed = kwargs.get("random_state", kwargs.get("seed", 42))
+        seed = kwargs.get("random_state", kwargs.get("seed", 123))
         self.model = LGBMRegressor(
             n_estimators=n_estimators,
             learning_rate=learning_rate,

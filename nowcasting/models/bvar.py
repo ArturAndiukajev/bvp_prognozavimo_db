@@ -138,16 +138,40 @@ class VARNowcast(BaseNowcastModel):
     Baseline frequentist VAR using statsmodels.
     Equivalent to the old BVARNowcast before the Bayesian upgrade.
     """
-    def __init__(self, target_col: str, horizon: int = 1, lags: int = 3, **kwargs):
+    def __init__(self, target_col: str, horizon: int = 1, lags: int = 3, max_vars: int = 30, **kwargs):
         super().__init__(target_col, horizon, **kwargs)
         self.lags = lags
+        self.max_vars = max_vars
         self.fitted_res_ = None
         self.endog_names_ = None
+        self.n_features_seen_ = 0
+        self.prediction_type = "recursive_forecast"
 
     def _clean(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
         full = pd.concat([X, y.rename(self.target_col)], axis=1)
         valid_cols = full.columns[full.isna().mean() < 0.5]
         full = full[valid_cols]
+        
+        self.n_features_seen_ = X.shape[1]
+        max_safe_vars = max(10, min(self.max_vars, max(1, len(full)) // max(1, self.lags)))
+        
+        if len(full.columns) > max_safe_vars:
+            logger.warning(
+                f"VAR safeguard: Input has {len(full.columns)} features. "
+                f"Truncating to {max_safe_vars} to prevent matrix singularity. "
+                f"Use a feature selector before VAR if you see this!"
+            )
+            completeness = full.notna().mean()
+            keep = [self.target_col] + (
+                completeness.drop(self.target_col, errors="ignore")
+                            .sort_values(ascending=False)
+                            .head(max_safe_vars - 1)
+                            .index.tolist()
+            )
+            # Ensure target is still there if dropped
+            if self.target_col not in keep: keep = [self.target_col] + keep[:max_safe_vars-1]
+            full = full[keep]
+
         self.endog_names_ = full.columns.tolist()
         return full.ffill().bfill()
 
@@ -169,6 +193,7 @@ class VARNowcast(BaseNowcastModel):
         if not self.is_fitted:
             raise ValueError("Model not fitted.")
         steps = len(X_test)
+        logger.info(f"VAR generating {steps}-step recursive forecast (ignoring X_test values).")
         lag_order = max(self.fitted_res_.k_ar, 1)  # guard: AIC may select 0 lags
         history = self.fitted_res_.endog[-lag_order:]
         try:
@@ -208,7 +233,7 @@ class BVARNowcast(BaseNowcastModel):
         Maximum number of variables to include in the VAR system.
         Set to limit dimensionality (collapses via column selection). Default 30.
     seed : int
-        Random seed for reproducibility (used by numpy). Default 42.
+        Random seed for reproducibility (used by numpy). Default 123.
     """
 
     def __init__(
@@ -221,7 +246,7 @@ class BVARNowcast(BaseNowcastModel):
         lambda2: float = 0.5,
         lambda3: float = 1.0,
         max_vars: int = 30,
-        seed: int = 42,
+        seed: int = 123,
         **kwargs,
     ):
         super().__init__(target_col, horizon, **kwargs)
@@ -238,12 +263,14 @@ class BVARNowcast(BaseNowcastModel):
         self._endog_cols: list[str] = []
         self._target_idx: int = -1
         self._lags_used: int = lags
+        self.n_features_seen_ = 0
+        self.prediction_type = "recursive_forecast"
 
         # Delegate to baseline VAR if mode == "var"
         self._var_delegate: Optional[VARNowcast] = None
         if self.mode == "var":
             self._var_delegate = VARNowcast(
-                target_col=target_col, horizon=horizon, lags=lags, **kwargs
+                target_col=target_col, horizon=horizon, lags=lags, max_vars=max_vars, **kwargs
             )
 
     # ------------------------------------------------------------------
@@ -264,14 +291,23 @@ class BVARNowcast(BaseNowcastModel):
         if self.target_col not in full.columns:
             raise ValueError(f"Target '{self.target_col}' not present after NaN cleanup.")
 
-        # Cap dimensionality: keep target + top max_vars-1 by completeness
-        if len(full.columns) > self.max_vars:
+        self.n_features_seen_ = X.shape[1]
+        
+        # Cap dimensionality: Final safety net to avoid singular matrices
+        # We allow up to max_vars, but bounded by sample_size / lags
+        max_safe_vars = max(10, min(self.max_vars, max(1, len(full)) // max(1, self.lags)))
+
+        if len(full.columns) > max_safe_vars:
+            logger.warning(
+                f"BVAR safeguard: Input has {len(full.columns)} features. "
+                f"Truncating to {max_safe_vars} based on completeness to prevent matrix singularity. "
+                f"Use an explicit feature selector before BVAR to avoid this fallback!"
+            )
             completeness = full.notna().mean()
-            # Always keep target
             keep = [self.target_col] + (
                 completeness.drop(self.target_col)
                             .sort_values(ascending=False)
-                            .head(self.max_vars - 1)
+                            .head(max_safe_vars - 1)
                             .index.tolist()
             )
             full = full[keep]
@@ -324,6 +360,7 @@ class BVARNowcast(BaseNowcastModel):
         lags = self._lags_used
         K = len(self._endog_cols)
         steps = len(X_test)
+        logger.info(f"BVAR generating {steps}-step recursive forecast (ignoring X_test values).")
 
         # Seed the history with the last `lags` rows from training
         history = self._data_train[-lags:].copy()   # (lags, K)

@@ -192,7 +192,7 @@ class MIDASNowcast(BaseNowcastModel):
         self._fitted_freq_ratio: int = freq_ratio or 3
         self._feature_cols: list[str] = []
 
-        seed = kwargs.get("seed", kwargs.get("random_state", 42))
+        seed = kwargs.get("seed", kwargs.get("random_state", 123))
         reg_kw = regression_kwargs or {}
         reg_type = regression_model.lower()
 

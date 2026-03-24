@@ -112,7 +112,7 @@ class TACTiSNowcastWrapper(BaseNowcastModel):
         lr: float = 1e-3,
         num_samples: int = 100,
         device: Optional[str] = None,
-        seed: int = 42,
+        seed: int = 123,
         # Architecture params
         skip_copula: bool = False,
         flow_series_embedding_dim: int = 5,
@@ -143,6 +143,7 @@ class TACTiSNowcastWrapper(BaseNowcastModel):
         self.num_samples = num_samples
         self.seed = seed
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.prediction_type = "approximate_conditional"
 
         # Architecture
         self.skip_copula = skip_copula
