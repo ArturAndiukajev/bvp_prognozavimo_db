@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import time
+import random
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from joblib import Parallel, delayed
@@ -33,7 +34,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 # We import pipeline bits from nowcasting package
-from nowcasting.main import build_arg_parser as build_main_parser, load_cf_panel, _DEFAULT_DATA_DIR
+from nowcasting.main import build_arg_parser as build_main_parser, load_cf_panel, load_mf_panels, _DEFAULT_DATA_DIR
 from nowcasting.evaluation.backtester import RollingBacktester
 from nowcasting.evaluation.metrics import compute_metrics
 from nowcasting.models.dfm import DynamicFactorNowcast
@@ -54,28 +55,34 @@ def build_experiment_parser() -> argparse.ArgumentParser:
     ap.add_argument("--data-dir", type=str, default=_DEFAULT_DATA_DIR)
     ap.add_argument("--target", type=str, default=None)
     ap.add_argument("--input-panel", type=str, default=None)
+    ap.add_argument("--mixed-frequency", action="store_true", help="Run in mixed-frequency mode")
+    ap.add_argument("--quarterly-cols", type=str, default="", help="Comma-separated quarterly columns for MF DFM")
+    ap.add_argument("--seed", type=int, default=123, help="Random seed for grid search sampling")
     
     # Grid Search Spaces (Comma-separated lists)
     ap.add_argument("--selectors", type=str, default="none,fast_screen,pca,lasso,elasticnet,corr_top_n",
                     help="Comma-separated selectors to test: none,fast_screen,pca,lasso,elasticnet,corr_top_n,factor_analysis,autoencoder")
+    ap.add_argument("--selectors-fast-only", type=str, default="fast_screen,corr_top_n", help="Optional subset of selectors for stage 1")
     
-    ap.add_argument("--dfm-k-factors", type=str, default="1,2,3")
-    ap.add_argument("--dfm-factor-orders", type=str, default="1,2")
+    ap.add_argument("--dfm-k-factors", type=str, default="1,2,3,5,8")
+    ap.add_argument("--dfm-factor-orders", type=str, default="1,2,3")
     
-    ap.add_argument("--pca-components", type=str, default="3,5,10")
+    ap.add_argument("--pca-components", type=str, default="3,5,10,20")
     ap.add_argument("--factor-analysis-components", type=str, default="3,5")
     ap.add_argument("--lasso-alphas", type=str, default="0.01,0.1")
     ap.add_argument("--elasticnet-alphas", type=str, default="0.01,0.1")
     ap.add_argument("--elasticnet-l1-ratios", type=str, default="0.5")
-    ap.add_argument("--corr-top-n", type=str, default="10,20,50")
+    ap.add_argument("--corr-top-n", type=str, default="10,20,50,100,200")
     ap.add_argument("--ae-latent-dims", type=str, default="3,5")
-    ap.add_argument("--fast-screen-top-k", type=str, default="50,100")
+    ap.add_argument("--fast-screen-top-k", type=str, default="50,100,250,500")
 
     # Time rules
     ap.add_argument("--train-windows", type=str, default="120", 
                     help="Initial train window sizes (e.g., 80,120)")
     ap.add_argument("--step-sizes", type=str, default="1", 
                     help="Backtest step sizes (e.g., 1,3)")
+    ap.add_argument("--window-type", type=str, default="expanding,rolling", help="expanding or rolling or both")
+    ap.add_argument("--rolling-window-size", type=str, default="120", help="Rolling window size, relevant only if window-type includes rolling")
     
     # Experiment controls
     ap.add_argument("--search-mode", type=str, choices=["quick", "full"], default="full",
@@ -115,7 +122,7 @@ def build_selector(method: str, params: dict):
     elif method == "autoencoder":
         return AutoencoderCompressor(latent_dim=params.get("latent_dim", 5), epochs=10)
     elif method == "fast_screen":
-        return FastScreeningFilter(top_k=params.get("top_n", 50))
+        return FastScreeningFilter(top_k=params.get("top_k", params.get("top_n", 50)))
     else:
         raise ValueError(f"Unknown selector method: {method}")
 
@@ -130,9 +137,6 @@ def run_single_experiment(
     """Runs a single combination grid configuration and returns metrics."""
     res = {**config}
     res["status"] = "running"
-    res["window_type"] = "expanding"
-    res["eval_mode"] = "common_frequency"
-    res["n_folds"] = None
     
     try:
         t0 = time.time()
@@ -146,11 +150,13 @@ def run_single_experiment(
             required_start_index = len(y_target) - search_last_n_steps
             init_train = max(init_train, required_start_index)
             
+        # [NEW]: Use fallback to eval_mode="mixed_frequency" and pass rolling window parameter
         bt = RollingBacktester(
             initial_train_periods=init_train, 
             step_size=step_sz,
-            window_type="expanding",
-            eval_mode="common_frequency"
+            window_type=config.get("window_type", "expanding"),
+            eval_mode="mixed_frequency" if config.get("mixed_frequency") else "common_frequency",
+            rolling_window_size=config.get("rolling_window_size")
         )
 
         
@@ -167,7 +173,15 @@ def run_single_experiment(
         if search_mode == "quick":
             mod_kws["maxiter"] = 50  # Faster, lower tolerance DFM fits
             
-        model = DynamicFactorNowcast(target_col=str(y_target.name), k_factors=k, factor_order=fo, **mod_kws)
+        # [NEW/BUGFIX]: Pass mixed_frequency down to DFM to support MQ. Include quarterly cols metadata.
+        model = DynamicFactorNowcast(
+            target_col=str(y_target.name), 
+            k_factors=k, 
+            factor_order=fo, 
+            mixed_frequency=config.get("mixed_frequency", False),
+            quarterly_cols=config.get("quarterly_cols", []),
+            **mod_kws
+        )
         
         # 4. Run loop
         # We temporarily disable internal statsmodels progress output inside parallel steps
@@ -223,6 +237,8 @@ def generate_experiment_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
     factor_orders = parse_list(args.dfm_factor_orders, int)
     train_windows = parse_list(args.train_windows, int)
     step_sizes = parse_list(args.step_sizes, int)
+    window_types = [w.strip() for w in args.window_type.split(",")]
+    rolling_window_sizes = parse_list(args.rolling_window_size, int)
     
     grids = []
     
@@ -247,23 +263,38 @@ def generate_experiment_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
         elif sel == "autoencoder":
             param_variations = [{"latent_dim": n} for n in parse_list(args.ae_latent_dims, int)]
         elif sel == "fast_screen":
-            param_variations = [{"top_n": n} for n in parse_list(args.fast_screen_top_k, int)]
+            param_variations = [{"top_k": n} for n in parse_list(args.fast_screen_top_k, int)]
             
         for p_var in param_variations:
             # Cartesian with DFM params
-            for (k, fo, tw, sz) in itertools.product(k_factors, factor_orders, train_windows, step_sizes):
-                grids.append({
+            for (k, fo, tw, sz, wt) in itertools.product(k_factors, factor_orders, train_windows, step_sizes, window_types):
+                cfg = {
                     "selector_method": sel,
                     "selector_params": p_var,
                     "dfm_k_factors": k,
                     "dfm_factor_order": fo,
                     "train_window": tw,
-                    "step_size": sz
-                })
+                    "step_size": sz,
+                    "window_type": wt,
+                    "mixed_frequency": getattr(args, "mixed_frequency", False),
+                }
+                if getattr(args, "mixed_frequency", False):
+                    q_cols = getattr(args, "quarterly_cols", "")
+                    cfg["quarterly_cols"] = [c.strip() for c in q_cols.split(",") if c.strip()]
                 
+                # Expand rolling_window_size only if window_type == "rolling"
+                if wt == "rolling":
+                    for rws in rolling_window_sizes:
+                        r_cfg = cfg.copy()
+                        r_cfg["rolling_window_size"] = rws
+                        grids.append(r_cfg)
+                else:
+                    grids.append(cfg)
+                
+    # [BUGFIX]: Seed RNG instead of random.shuffle for reproducible pipelines
     if args.search_max_configs > 0 and len(grids) > args.search_max_configs:
-        import random
-        random.shuffle(grids)
+        rng = random.Random(getattr(args, "seed", 123))
+        rng.shuffle(grids)
         grids = grids[:args.search_max_configs]
         
     return grids
@@ -274,13 +305,22 @@ def main():
     args = ap.parse_args()
     
     logger.info("=== DFM Experiment Search Runner ===")
+    random.seed(args.seed)
     
     # 1. Load Data
     data_dir = Path(args.data_dir)
-    logger.info(f"Loading panel ...")
-    X_panel, y_target = load_cf_panel(data_dir, args.target, panel_arg=args.input_panel)
-    
-    logger.info(f"Panel shape: {X_panel.shape}, Target shape: {y_target.shape}")
+    # [NEW]: Mixed Frequency load support. Auto-combines M and Q panels for the model.
+    if args.mixed_frequency:
+        logger.info(f"Loading MF panel ...")
+        X_m, X_q, y_target = load_mf_panels(data_dir, args.target, panel_arg=args.input_panel)
+        X_panel = pd.concat([X_m, X_q], axis=1) if not X_q.empty else X_m
+        if not args.quarterly_cols and not X_q.empty:
+            args.quarterly_cols = ",".join(X_q.columns)
+        logger.info(f"MF Panel combined shape: {X_panel.shape}, Target shape: {y_target.shape}")
+    else:
+        logger.info(f"Loading CF panel ...")
+        X_panel, y_target = load_cf_panel(data_dir, args.target, panel_arg=args.input_panel)
+        logger.info(f"Panel shape: {X_panel.shape}, Target shape: {y_target.shape}")
     
     # 2. Build Grid
     grid = generate_experiment_grid(args)
@@ -302,16 +342,22 @@ def main():
     }
     
     if args.search_strategy == "staged":
-        logger.info(f"--- Stage 1: Coarse Search ({len(grid)} configs, 3 steps) ---")
+        s1_sels = [s.strip() for s in args.selectors_fast_only.split(",")]
+        grid_s1 = [cfg for cfg in grid if cfg["selector_method"] in s1_sels]
+        if not grid_s1:
+            logger.warning("Stage 1 grid empty (selectors-fast-only mismatch). Falling back to full grid.")
+            grid_s1 = grid
+            
+        logger.info(f"--- Stage 1: Coarse Search ({len(grid_s1)} configs, 3 steps) ---")
         run_kwargs["search_last_n_steps"] = min(3, args.search_last_n_steps) if args.search_last_n_steps > 0 else 3
         if args.n_jobs > 1:
             results_s1 = Parallel(n_jobs=args.n_jobs, verbose=10)(
-                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid
+                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid_s1
             )
         else:
             results_s1 = []
-            for i, cfg in enumerate(grid, 1):
-                logger.info(f"[{i}/{len(grid)}] Stage 1 Running: {cfg}")
+            for i, cfg in enumerate(grid_s1, 1):
+                logger.info(f"[{i}/{len(grid_s1)}] Stage 1 Running: {cfg}")
                 results_s1.append(run_single_experiment(cfg, **run_kwargs))
 
         df_s1 = pd.DataFrame([r for r in results_s1 if r["status"] == "success"])
@@ -371,8 +417,8 @@ def main():
         out_path = Path(args.out_file)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        best_idx = success["rmse"].idxmin()
-        best_eval_df = df_res.loc[best_idx, "_eval_df"]
+        # [BUGFIX]: Avoid using idxmin on rmse string or disconnected metrics, directly slice via index sorted
+        best_eval_df = success.iloc[0]["_eval_df"]
         preds_path = out_path.parent / f"predictions_dfm_{args.seed}.csv"
         best_eval_df.to_csv(preds_path, index=False)
         logger.info(f"DFM best preds → {preds_path}")
