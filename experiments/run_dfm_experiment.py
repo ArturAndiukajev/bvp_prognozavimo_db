@@ -34,7 +34,8 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 # We import pipeline bits from nowcasting package
-from nowcasting.main import build_arg_parser as build_main_parser, load_cf_panel, load_mf_panels, _DEFAULT_DATA_DIR
+from nowcasting.main import build_arg_parser as build_main_parser
+from nowcasting.utils.data_loader import load_cf_panel, load_mf_panels, _DEFAULT_DATA_DIR
 from nowcasting.evaluation.backtester import RollingBacktester
 from nowcasting.evaluation.metrics import compute_metrics
 from nowcasting.models.dfm import DynamicFactorNowcast

@@ -84,7 +84,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from nowcasting.main import load_cf_panel, _DEFAULT_DATA_DIR
+from nowcasting.utils.data_loader import load_cf_panel, _DEFAULT_DATA_DIR
 from nowcasting.evaluation.backtester import RollingBacktester
 from nowcasting.evaluation.metrics import compute_metrics
 from nowcasting.models.ml_regression import ElasticNetNowcast, LightGBMNowcast
@@ -112,16 +112,9 @@ def _sanitize(s: str) -> str:
     return re.sub(r"[^\w\-.]", "_", str(s))
 
 
-def _shorten(s: str, max_len: int = 40) -> str:
-    s = str(s)
-    if len(s) <= max_len:
-        return s
-    keep = max_len // 2 - 1
-    return s[:keep] + "_" + s[-keep:]
-
 
 def _build_suffix(panel_path: Optional[Path], seed: int, model: str = "") -> str:
-    stem = _shorten(_sanitize(panel_path.stem if panel_path else "panel"), 30)
+    stem = _sanitize(panel_path.stem if panel_path else "panel")[:30]
     parts = [model, stem, f"s{seed}"] if model else [stem, f"s{seed}"]
     return "_".join(p for p in parts if p)
 

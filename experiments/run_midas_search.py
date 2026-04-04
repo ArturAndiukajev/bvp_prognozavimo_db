@@ -75,7 +75,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 # Ensure project root is importable when run as a script
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from nowcasting.main import load_cf_panel, _DEFAULT_DATA_DIR
+from nowcasting.utils.data_loader import load_mf_panels, _DEFAULT_DATA_DIR
 from nowcasting.evaluation.backtester import RollingBacktester
 from nowcasting.evaluation.metrics import compute_metrics
 from nowcasting.models.midas import MIDASNowcast
@@ -121,8 +121,8 @@ def _build_suffix(
     selector: str = "",
 ) -> str:
     """Build a short, safe filename suffix from key run parameters."""
-    stem = _shorten(_sanitize(panel_path.stem if panel_path else "panel"), 30)
-    parts = ["midas", stem]
+    panel_stem = _sanitize(panel_path.stem if panel_path else "panel")[:30]
+    parts = ["midas", panel_stem]
     if lf_freq:
         parts.append(_sanitize(lf_freq).lower())
     if selector and selector != "none":

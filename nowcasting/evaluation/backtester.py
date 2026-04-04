@@ -72,6 +72,7 @@ class RollingBacktester:
         y_target: pd.Series,
         transformer=None,
         feature_selector=None,
+        step_callback=None,
     ) -> pd.DataFrame:
         if X_panel is None or y_target is None or X_panel.empty or y_target.empty:
             logger.warning("Backtester: empty X_panel or y_target.")
@@ -84,6 +85,7 @@ class RollingBacktester:
                 y_target=y_target,
                 transformer=transformer,
                 feature_selector=feature_selector,
+                step_callback=step_callback,
             )
 
         return self._backtest_common_frequency(
@@ -92,6 +94,7 @@ class RollingBacktester:
             y_target=y_target,
             transformer=transformer,
             feature_selector=feature_selector,
+            step_callback=step_callback,
         )
 
     # ------------------------------------------------------------------
@@ -104,6 +107,7 @@ class RollingBacktester:
         y_target: pd.Series,
         transformer=None,
         feature_selector=None,
+        step_callback=None,
     ) -> pd.DataFrame:
         common_idx = X_panel.index.intersection(y_target.index)
         if len(common_idx) == 0:
@@ -162,7 +166,7 @@ class RollingBacktester:
                         target_index=X_test_orig.index,
                         forecast_origin=forecast_origin,
                         model_name=model.__class__.__name__,
-                        prediction_type=getattr(model, "prediction_type", "conditional_nowcast"),
+                        prediction_type=getattr(model, "prediction_type", "pure_forecast"),
                         n_raw_features=n_raw_features,
                         n_trans_features=n_trans_features,
                         n_sel_features=n_sel_features,
@@ -204,7 +208,7 @@ class RollingBacktester:
                 )
                 preds_df["Forecast_Origin"] = forecast_origin
                 preds_df["Model"] = model.__class__.__name__
-                preds_df["Prediction_Type"] = getattr(model, "prediction_type", "conditional_nowcast")
+                preds_df["Prediction_Type"] = getattr(model, "prediction_type", "pure_forecast")
                 preds_df["n_raw_features"] = n_raw_features
                 preds_df["n_trans_features"] = n_trans_features
                 preds_df["n_sel_features"] = n_sel_features
@@ -212,6 +216,15 @@ class RollingBacktester:
 
                 out_preds.append(preds_df)
                 n_steps_run += 1
+                
+                # Pruning callback hook
+                if step_callback is not None:
+                    _tmp_df = self._finalize_predictions(out_preds, y_target)
+                    _tmp_df = _tmp_df.dropna(subset=["Actual", "Predicted"])
+                    if not _tmp_df.empty:
+                        running_rmse = float(np.sqrt(((_tmp_df["Actual"] - _tmp_df["Predicted"]) ** 2).mean()))
+                        step_callback(running_rmse, step=n_steps_run)
+                        
             except Exception as e:
                 logger.error(
                     f"CF step failed | {model.__class__.__name__}: {e} | "
@@ -223,7 +236,7 @@ class RollingBacktester:
                         target_index=X_test_orig.index,
                         forecast_origin=forecast_origin,
                         model_name=model.__class__.__name__,
-                        prediction_type=getattr(model, "prediction_type", "conditional_nowcast"),
+                        prediction_type=getattr(model, "prediction_type", "pure_forecast"),
                         n_raw_features=n_raw_features,
                         n_trans_features=n_trans_features,
                         n_sel_features=n_sel_features,
@@ -247,6 +260,7 @@ class RollingBacktester:
         y_target: pd.Series,
         transformer=None,
         feature_selector=None,
+        step_callback=None,
     ) -> pd.DataFrame:
         # Mixed-frequency contract:
         # - X_panel is high-frequency
@@ -318,7 +332,7 @@ class RollingBacktester:
                         target_index=pred_target_dates,
                         forecast_origin=forecast_origin,
                         model_name=model.__class__.__name__,
-                        prediction_type=getattr(model, "prediction_type", "conditional_nowcast"),
+                        prediction_type=getattr(model, "prediction_type", "pure_forecast"),
                         n_raw_features=n_raw_features,
                         n_trans_features=n_trans_features,
                         n_sel_features=n_sel_features,
@@ -364,7 +378,7 @@ class RollingBacktester:
                 )
                 preds_df["Forecast_Origin"] = forecast_origin
                 preds_df["Model"] = model.__class__.__name__
-                preds_df["Prediction_Type"] = getattr(model, "prediction_type", "conditional_nowcast")
+                preds_df["Prediction_Type"] = getattr(model, "prediction_type", "pure_forecast")
                 preds_df["n_raw_features"] = n_raw_features
                 preds_df["n_trans_features"] = n_trans_features
                 preds_df["n_sel_features"] = n_sel_features
@@ -372,6 +386,15 @@ class RollingBacktester:
 
                 out_preds.append(preds_df)
                 n_steps_run += 1
+                
+                # Pruning callback hook
+                if step_callback is not None:
+                    _tmp_df = self._finalize_predictions(out_preds, y_target)
+                    _tmp_df = _tmp_df.dropna(subset=["Actual", "Predicted"])
+                    if not _tmp_df.empty:
+                        running_rmse = float(np.sqrt(((_tmp_df["Actual"] - _tmp_df["Predicted"]) ** 2).mean()))
+                        step_callback(running_rmse, step=n_steps_run)
+                        
             except Exception as e:
                 logger.error(
                     f"MF step failed | {model.__class__.__name__}: {e} | "

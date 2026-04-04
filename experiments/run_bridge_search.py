@@ -27,7 +27,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-from nowcasting.main import load_cf_panel, load_mf_panels, _DEFAULT_DATA_DIR
+from nowcasting.utils.data_loader import load_mf_panels, _DEFAULT_DATA_DIR
 from nowcasting.evaluation.backtester import RollingBacktester
 from nowcasting.evaluation.metrics import compute_metrics
 from nowcasting.models.bridge_equation import BridgeEquationNowcast

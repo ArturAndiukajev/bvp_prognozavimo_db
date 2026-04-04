@@ -60,7 +60,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 # Ensure nowcasting package is importable when run as a script
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from nowcasting.main import load_cf_panel, _DEFAULT_DATA_DIR
+from nowcasting.utils.data_loader import load_cf_panel, _DEFAULT_DATA_DIR
 from nowcasting.evaluation.backtester import RollingBacktester
 from nowcasting.evaluation.metrics import compute_metrics
 from nowcasting.models.bvar import BVARNowcast
