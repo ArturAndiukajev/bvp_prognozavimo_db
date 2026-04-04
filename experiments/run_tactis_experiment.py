@@ -317,16 +317,16 @@ def optuna_objective(
 
     current_rmse = metrics["rmse"]
     
-    # Immediately dump heavy artifacts to disk if we find a new best
-    # This completely solves the Optuna OOM user_attr leak!
+    # Save per-trial artifacts automatically (parallel safe)
+    preds_path = tracker.out_dir / f"tactis_eval_df_trial_{trial.number}.csv"
+    eval_df.to_csv(preds_path, index=False)
+    
+    cfg_path = tracker.out_dir / f"tactis_trial_{trial.number}.json"
+    with open(cfg_path, 'w') as f:
+        json.dump(metrics, f, indent=4)
+        
     if current_rmse < tracker.best_rmse:
         tracker.best_rmse = current_rmse
-        preds_path = tracker.out_dir / f"tactis_optuna_best_preds_{tracker.suffix}.csv"
-        eval_df.to_csv(preds_path, index=False)
-        
-        best_cfg_path = tracker.out_dir / f"tactis_optuna_best_config_{tracker.suffix}.json"
-        with open(best_cfg_path, 'w') as f:
-            json.dump(metrics, f, indent=4)
         logger.info(f"Iteration {trial.number} | New Best RMSE: {current_rmse:.4f}")
         
     return current_rmse
@@ -348,7 +348,10 @@ def run_optuna_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse
     logger.info(f"Storage: {storage_url}")
     
     sampler = optuna.samplers.TPESampler(seed=args.seed)
-    pruner = optuna.pruners.MedianPruner()
+    
+    # Hyperband is an aggressive pruner well-suited for rolling backtests.
+    # Bad configs will be stopped early iteratively without waiting for full CV folds.
+    pruner = optuna.pruners.HyperbandPruner(min_resource=1, reduction_factor=3)
     
     study = optuna.create_study(
         study_name=study_name,
@@ -369,18 +372,20 @@ def run_optuna_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse
         pass # No completed trials yet
         
     # NOTE ON PARALLEL WORKERS:
-    # If running with n_jobs > 1 (e.g. joblib parallel processes or multiple script executions),
-    # this tracker's state logic might overwrite parallel saves asynchronously. 
-    # To make this fully multiprocess-safe, either:
-    # 1. Have each worker save its df as `tactis_eval_df_trial_{trial.number}.csv` and merge later.
-    # 2. Use a file lock to read/write the best dataframe safely.
+    # Instead of fighting locks for the `best` tracker concurrently, each
+    # process writes its own independent trial output. Tracking the `tracker.best_rmse`
+    # is merely used for lightweight logging indicators.
     tracker = OptunaBestTracker(out_dir, suffix, initial_best)
     
     def periodic_save_callback(study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
         if trial.number % args.save_every_n_trials == 0:
-            trials_df = study.trials_dataframe()
-            trials_filepath = out_dir / f"tactis_optuna_trials_{suffix}.csv"
-            trials_df.to_csv(trials_filepath, index=False)
+            try:
+                trials_df = study.trials_dataframe()
+                trials_filepath = out_dir / f"tactis_optuna_trials_{suffix}.csv"
+                trials_df.to_csv(trials_filepath, index=False)
+            except Exception:
+                pass # Gracefully handle OS locking collisions from parallel nodes
+
             
             try:
                 best_value = study.best_value
@@ -406,6 +411,7 @@ def run_optuna_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse
         study.optimize(
             lambda t: optuna_objective(t, X_panel, y_target, args, tracker),
             n_trials=args.n_trials,
+            n_jobs=args.n_jobs,
             catch=(Exception,),
             callbacks=[periodic_save_callback]
         )
@@ -425,7 +431,28 @@ def run_optuna_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse
             logger.error("No trials finished successfully.")
             return
             
-        logger.info(f"Global Best RMSE: {study.best_trial.value:.4f}")
+        best_trial = study.best_trial
+        logger.info(f"Global Best RMSE: {best_trial.value:.4f}")
+        
+        # Determine the global best safely and extract artifacts
+        best_preds_src = out_dir / f"tactis_eval_df_trial_{best_trial.number}.csv"
+        best_cfg_src = out_dir / f"tactis_trial_{best_trial.number}.json"
+        
+        if best_preds_src.exists():
+            import shutil
+            shutil.copy(best_preds_src, out_dir / f"tactis_optuna_best_preds_{suffix}.csv")
+            shutil.copy(best_cfg_src, out_dir / f"tactis_optuna_best_config_{suffix}.json")
+            logger.info("Copied true best trial artifacts to global representation.")
+            
+        # Cleanup temporary parallel files to save space
+        for p in out_dir.glob("tactis_eval_df_trial_*.csv"):
+            try: p.unlink()
+            except Exception: pass
+            
+        for p in out_dir.glob("tactis_trial_*.json"):
+            try: p.unlink()
+            except Exception: pass
+            
     except ValueError:
         logger.error("Could not retrieve best trial (maybe none succeeded).")
     
