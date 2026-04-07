@@ -16,18 +16,24 @@ import logging
 import os
 import random
 import time
-from pathlib import Path
 from typing import Any, Dict, List
 
 from joblib import Parallel, delayed
 import pandas as pd
+import optuna
 
 # Force single-thread linear algebra to prevent collision in parallel workers
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-from nowcasting.utils.data_loader import load_mf_panels, _DEFAULT_DATA_DIR
+# Ensure project root is importable when run as a script directly
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from nowcasting.evaluation.checkpoint import prune_grid, run_chunks, build_run_signature
+from nowcasting.utils.data_loader import load_mf_panels, load_cf_panel, _DEFAULT_DATA_DIR
 from nowcasting.evaluation.backtester import RollingBacktester
 from nowcasting.evaluation.metrics import compute_metrics
 from nowcasting.models.bridge_equation import BridgeEquationNowcast
@@ -107,8 +113,20 @@ def build_experiment_parser() -> argparse.ArgumentParser:
     ap.add_argument("--search-max-configs", type=int, default=0)
     ap.add_argument("--search-strategy", type=str, default="full", choices=["full", "staged"])
     ap.add_argument("--search-top-k", type=int, default=5)
+
+    # ---------- Optuna ----------
+    ap.add_argument("--engine", choices=["optuna", "grid", "staged"], default=None,
+                    help="Search engine to use: optuna (Bayesian), grid (exhaustive), staged (coarse-to-fine)")
+    ap.add_argument("--n-trials", type=int, default=50, help="Number of trials for Optuna engine")
+    ap.add_argument("--study-storage", type=str, default=None, 
+                    help="Optuna storage URI. Defaults to sqlite in results directory.")
+    ap.add_argument("--study-name", type=str, default=None, help="Optuna study name for persistence and resuming.")
+    ap.add_argument("--save-every-n-trials", type=int, default=5, help="Save summary CSV every N trials")
+
     ap.add_argument("--n-jobs", type=int, default=1)
 
+    ap.add_argument("--resume", action="store_true", help="Resume from an interrupted search using existing results CSV.")
+    ap.add_argument("--checkpoint-chunk-size", type=int, default=10, help="Save to CSV after completing this many configurations.")
     ap.add_argument("--out-file", type=str, default="data/forecasts/bridge_search_results.csv")
     return ap
 
@@ -280,6 +298,160 @@ def run_single_experiment(
     return res
 
 
+# ---------------------------------------------------------------------------
+# Optuna Engine
+# ---------------------------------------------------------------------------
+
+class OptunaBestTracker:
+    def __init__(self, out_dir: Path, suffix: str, initial_best: float = float("inf")):
+        self.best_rmse = initial_best
+        self.out_dir = out_dir
+        self.suffix = suffix
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        
+def optuna_objective(
+    trial: optuna.Trial, 
+    X_panel: pd.DataFrame, 
+    y_target: pd.Series, 
+    args: argparse.Namespace, 
+    tracker: OptunaBestTracker
+) -> float:
+    selector_name = trial.suggest_categorical("selector", ["none", "corr_top_n", "fast_screen", "lasso", "elasticnet", "pca", "factor_analysis", "autoencoder"])
+    selector_params = {}
+    
+    if selector_name == "corr_top_n":
+        selector_params["top_n"] = trial.suggest_int("corr_top_n_k", 5, 50)
+    elif selector_name == "lasso":
+        selector_params["alpha"] = trial.suggest_float("lasso_alpha", 1e-4, 1.0, log=True)
+    elif selector_name == "elasticnet":
+        selector_params["alpha"] = trial.suggest_float("elasticnet_selector_alpha", 1e-4, 1.0, log=True)
+        selector_params["l1_ratio"] = trial.suggest_float("elasticnet_selector_l1", 0.1, 0.9)
+    elif selector_name == "fast_screen":
+        selector_params["top_n"] = trial.suggest_int("fast_screen_k", 20, 100)
+    elif selector_name == "pca":
+        selector_params["n_components"] = trial.suggest_int("pca_comp", 2, 20)
+    elif selector_name == "factor_analysis":
+        selector_params["n_components"] = trial.suggest_int("fa_comp", 2, 20)
+    elif selector_name == "autoencoder":
+        selector_params["latent_dim"] = trial.suggest_int("ae_dim", 2, 20)
+
+    ar_lags = trial.suggest_int("ar_lags", 0, 12)
+    agg_rule = trial.suggest_categorical("agg_rule", ["mean", "last", "sum"])
+    reg_model = trial.suggest_categorical("regression_model", ["linear", "ridge", "lasso", "elasticnet"])
+
+    train_window = trial.suggest_categorical("train_window", [60, 80, 100, 120])
+    step_size = trial.suggest_categorical("step_size", [1, 3])
+    window_type = trial.suggest_categorical("window_type", ["expanding", "rolling"])
+    
+    config = {
+        "selector_method": selector_name,
+        "selector_params": selector_params,
+        "ar_lags": ar_lags,
+        "agg_rule": agg_rule,
+        "regression_model": reg_model,
+        "train_window": train_window,
+        "step_size": step_size,
+        "window_type": window_type,
+        "mixed_frequency": args.mixed_frequency,
+        "seed": args.seed,
+    }
+    
+    if window_type == "rolling":
+        config["rolling_window_size"] = trial.suggest_categorical("rolling_window_size", [40, 60, 80])
+        
+    res = run_single_experiment(
+        config=config,
+        X_panel=X_panel,
+        y_target=y_target,
+        search_mode=args.search_mode,
+        search_last_n_steps=args.search_last_n_steps,
+    )
+    
+    for k, v in res.items():
+        if k != "_eval_df":
+            trial.set_user_attr(k, v)
+            
+    if res.get("status") != "success":
+        raise optuna.TrialPruned(f"Run failed: {res.get('error_message', 'Unknown error')}")
+        
+    rmse = res.get("rmse")
+    if rmse is None or pd.isna(rmse):
+        raise optuna.TrialPruned("RMSE was NaN or None")
+        
+    if rmse < tracker.best_rmse:
+        tracker.best_rmse = rmse
+        if "_eval_df" in res and not res["_eval_df"].empty:
+            preds_path = tracker.out_dir / f"bridge_optuna_best_preds_{tracker.suffix}.csv"
+            res["_eval_df"].to_csv(preds_path, index=False)
+            logger.info(f"New best RMSE ({rmse:.4f}) -> {preds_path}")
+            
+    return rmse
+
+
+def run_optuna_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse.Namespace, out_dir: Path, suffix: str):
+    logger.info("Starting OPTUNA engine.")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    study_name = args.study_name or f"bridge_{suffix}"
+    storage_url = args.study_storage or f"sqlite:///{out_dir.absolute()}/bridge_optuna.db"
+    
+    sampler = optuna.samplers.TPESampler(seed=args.seed)
+    
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage_url,
+        direction="minimize",
+        load_if_exists=True,
+        sampler=sampler,
+    )
+    
+    tracker = OptunaBestTracker(out_dir, suffix)
+    
+    if len(study.trials) > 0:
+        logger.info(f"Resuming study '{study_name}' with {len(study.trials)} existing trials.")
+        try:
+            tracker.best_rmse = study.best_value
+        except ValueError:
+            pass
+
+    out_csv = out_dir / f"optuna_trials_{suffix}.csv"
+    
+    def save_callback(study_cb: optuna.Study, trial_cb: optuna.trial.FrozenTrial):
+        if trial_cb.number % args.save_every_n_trials == 0:
+            df_trials = study_cb.trials_dataframe()
+            df_trials.to_csv(out_csv, index=False)
+            try:
+                best_trial = study_cb.best_trial
+                best_dict = best_trial.user_attrs.copy()
+                best_dict["rmse"] = study_cb.best_value
+                with open(out_dir / f"optuna_best_config_{suffix}.json", "w") as f:
+                    json.dump(best_dict, f, indent=4, default=str)
+            except ValueError:
+                pass
+
+    study.optimize(
+        lambda t: optuna_objective(t, X_panel, y_target, args, tracker),
+        n_trials=args.n_trials,
+        n_jobs=args.n_jobs,
+        catch=(Exception,),
+        callbacks=[save_callback]
+    )
+    
+    df_trials = study.trials_dataframe()
+    df_trials.to_csv(out_csv, index=False)
+    logger.info(f"Optuna trials saved to {out_csv}")
+    
+    try:
+        best_trial = study.best_trial
+        logger.info(f"Optuna Best RMSE: {best_trial.value:.4f}")
+        logger.info(f"Optuna Best Params: {best_trial.params}")
+        best_dict = best_trial.user_attrs.copy()
+        with open(out_dir / f"optuna_best_config_{suffix}.json", "w") as f:
+            json.dump(best_dict, f, indent=4, default=str)
+    except ValueError:
+        logger.warning("No successful trials completed.")
+
+
 def generate_experiment_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
     selectors_to_run = parse_list(args.selectors, str)
     ar_lags_list = parse_list(args.ar_lags, int)
@@ -377,69 +549,89 @@ def main():
 
     logger.info(f"Running experiments (n_jobs={args.n_jobs}, mode={args.search_mode}) ...")
     tstart = time.time()
+    
+    out_path = Path(args.out_file)
+    suffix_base = (Path(args.input_panel).stem if args.input_panel else "panel")[:30] + f"_s{args.seed}"
+    
+    active_engine = args.engine
+    if active_engine is None:
+        active_engine = "staged" if args.search_strategy == "staged" else "grid"
 
-    if args.search_strategy == "staged":
+    if active_engine == "optuna":
+        run_optuna_engine(X_panel, y_target, args, out_path.parent, suffix_base)
+        return
+
+    if active_engine == "staged":
         logger.info(f"--- Stage 1: Coarse Search ({len(grid)} configs, 3 steps) ---")
         stage1_kwargs = dict(run_kwargs)
-        stage1_kwargs["search_last_n_steps"] = min(3, args.search_last_n_steps) if args.search_last_n_steps > 0 else 3
+        stage1_steps = min(3, args.search_last_n_steps) if args.search_last_n_steps > 0 else 3
+        stage1_kwargs["search_last_n_steps"] = stage1_steps
+        
+        run_signature = build_run_signature(
+            script_name="run_bridge_search.py",
+            input_panel=str(args.input_panel or args.data_dir),
+            target=str(args.target),
+            seed=args.seed,
+            search_last_n_steps=args.search_last_n_steps,
+            search_strategy=args.search_strategy,
+            mixed_frequency=args.mixed_frequency
+        )
+        
+        grid_s1 = prune_grid(grid, stage1_steps, out_path, getattr(args, "resume", False), run_signature=run_signature)
+        results_s1 = run_chunks(grid_s1, run_single_experiment, stage1_kwargs, out_path, n_jobs=args.n_jobs, chunk_sz=getattr(args, "checkpoint_chunk_size", 10), stage_name="Stage 1")
 
-        if args.n_jobs > 1:
-            results_s1 = Parallel(n_jobs=args.n_jobs, verbose=10)(
-                delayed(run_single_experiment)(cfg, **stage1_kwargs) for cfg in grid
-            )
+        if out_path.exists():
+            try:
+                full_s1_df = pd.read_csv(out_path)
+                full_s1_df = full_s1_df[(full_s1_df["status"] == "success")]
+                best_configs = full_s1_df.sort_values("rmse").head(args.search_top_k).to_dict("records")
+            except Exception:
+                df_s1 = pd.DataFrame([r for r in results_s1 if r.get("status") == "success"])
+                best_configs = df_s1.sort_values("rmse", ascending=True).head(args.search_top_k).to_dict("records") if not df_s1.empty else []
         else:
-            results_s1 = []
-            for i, cfg in enumerate(grid, 1):
-                logger.info(f"[{i}/{len(grid)}] Stage 1 Running: {cfg}")
-                results_s1.append(run_single_experiment(cfg, **stage1_kwargs))
+            df_s1 = pd.DataFrame([r for r in results_s1 if r.get("status") == "success"])
+            best_configs = df_s1.sort_values("rmse", ascending=True).head(args.search_top_k).to_dict("records") if not df_s1.empty else []
 
-        df_s1 = pd.DataFrame([r for r in results_s1 if r.get("status") == "success"])
-        if df_s1.empty:
+        if not best_configs:
             logger.error("Stage 1 failed completely.")
             return
 
-        df_s1 = df_s1.sort_values("rmse", ascending=True).reset_index(drop=True)
-        top_k = min(len(df_s1), args.search_top_k)
-        best_configs = df_s1.head(top_k).to_dict("records")
-
-        logger.info(f"--- Stage 2: Fine Search (Top {top_k} configs, {args.search_last_n_steps} steps) ---")
+        logger.info(f"--- Stage 2: Fine Search (Top {len(best_configs)} configs, {args.search_last_n_steps} steps) ---")
         clean_keys = set(grid[0].keys())
         staged_grid = [{k: v for k, v in cfg.items() if k in clean_keys} for cfg in best_configs]
+        staged_grid = prune_grid(staged_grid, args.search_last_n_steps, out_path, getattr(args, "resume", False), run_signature=run_signature)
 
-        if args.n_jobs > 1:
-            results = Parallel(n_jobs=args.n_jobs, verbose=10)(
-                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in staged_grid
-            )
-        else:
-            results = []
-            for i, cfg in enumerate(staged_grid, 1):
-                logger.info(f"[{i}/{len(staged_grid)}] Stage 2 Running: {cfg}")
-                results.append(run_single_experiment(cfg, **run_kwargs))
+        results = run_chunks(staged_grid, run_single_experiment, run_kwargs, out_path, n_jobs=args.n_jobs, chunk_sz=getattr(args, "checkpoint_chunk_size", 10), stage_name="Stage 2")
     else:
-        if args.n_jobs > 1:
-            results = Parallel(n_jobs=args.n_jobs, verbose=10)(
-                delayed(run_single_experiment)(cfg, **run_kwargs) for cfg in grid
-            )
-        else:
-            results = []
-            for i, cfg in enumerate(grid, 1):
-                logger.info(f"[{i}/{len(grid)}] Running: {cfg}")
-                results.append(run_single_experiment(cfg, **run_kwargs))
+        run_signature = build_run_signature(
+            script_name="run_bridge_search.py",
+            input_panel=str(args.input_panel or args.data_dir),
+            target=str(args.target),
+            seed=args.seed,
+            search_last_n_steps=args.search_last_n_steps,
+            search_strategy=args.search_strategy,
+            mixed_frequency=args.mixed_frequency
+        )
+        grid = prune_grid(grid, args.search_last_n_steps, out_path, getattr(args, "resume", False), run_signature=run_signature)
+        results = run_chunks(grid, run_single_experiment, run_kwargs, out_path, n_jobs=args.n_jobs, chunk_sz=getattr(args, "checkpoint_chunk_size", 10))
 
     total_time = time.time() - tstart
-    df_res = pd.DataFrame(results)
+
+    if out_path.exists():
+        df_res = pd.read_csv(out_path)
+    else:
+        df_res = pd.DataFrame(results)
 
     if df_res.empty:
         logger.error("No results produced.")
         return
 
     if "selector_params" in df_res.columns:
-        df_res["selector_params"] = df_res["selector_params"].apply(json.dumps)
+        df_res["selector_params"] = df_res["selector_params"].apply(lambda x: json.dumps(x) if isinstance(x, dict) else x)
 
     success = df_res[df_res["status"] == "success"].copy()
     failed_count = len(df_res) - len(success)
 
-    out_path = Path(args.out_file)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if success.empty:
@@ -476,14 +668,25 @@ def main():
         ].to_string(index=False)
     )
 
-    best_eval_df = success.iloc[0]["_eval_df"]
-    preds_path = out_path.parent / f"predictions_bridge_{args.seed}.csv"
-    best_eval_df.to_csv(preds_path, index=False)
-    logger.info(f"Bridge best preds → {preds_path}")
+    best_cfg = success.iloc[0].to_dict()
+    memory_res = [r for r in results if r.get("_config_id") == best_cfg.get("_config_id")]
+    if memory_res and "_eval_df" in memory_res[0]:
+        best_eval_df = memory_res[0]["_eval_df"]
+    else:
+        logger.info("Re-evaluating best configuration to regenerate predictions output...")
+        b_cfg = {k:v for k,v in best_cfg.items() if not str(k).startswith("_")}
+        if isinstance(b_cfg.get('selector_params'), str):
+            b_cfg['selector_params'] = json.loads(b_cfg['selector_params'])
+        b_res = run_single_experiment(b_cfg, **run_kwargs)
+        best_eval_df = b_res.get("_eval_df", pd.DataFrame())
+
+    if not best_eval_df.empty:
+        preds_path = out_path.parent / f"predictions_bridge_{args.seed}.csv"
+        best_eval_df.to_csv(preds_path, index=False)
+        logger.info(f"Bridge best preds → {preds_path}")
 
     if "_eval_df" in df_out.columns:
         df_out = df_out.drop(columns=["_eval_df"])
-
     df_out.to_csv(out_path, index=False)
     logger.info(f"\nDetailed results saved to {out_path.absolute()}")
 

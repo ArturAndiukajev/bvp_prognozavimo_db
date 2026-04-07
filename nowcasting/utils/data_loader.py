@@ -66,6 +66,22 @@ def validate_inputs(
 
     return True
 
+def validate_target_column(target_col: str) -> None:
+    """Verifies that the target column is a valid data column, not a helper ID."""
+    invalid_cols = {"series_id", "series_key", "category", "period_date", "month_end", "year_month", "date"}
+    if str(target_col).lower() in invalid_cols:
+        raise ValueError(f"Invalid target column selected: '{target_col}'. It is an ID/helper column, not data.")
+
+def validate_unique_index(df_or_series, name: str) -> None:
+    """Ensures the index is unique, throwing a clear error otherwise to prevent backtesting failure."""
+    if not df_or_series.index.is_unique:
+        dups = df_or_series.index[df_or_series.index.duplicated()].unique()
+        raise ValueError(
+            f"Duplicate index found in {name}! "
+            f"Please fix upstream data generation. "
+            f"Duplicated dates: {list(dups[:3])}{'...' if len(dups)>3 else ''}"
+        )
+
 def _load_data_with_datetime_index(path: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".csv":
         df = pd.read_csv(path)
@@ -79,8 +95,13 @@ def _load_data_with_datetime_index(path: Path) -> pd.DataFrame:
 
     df.index = pd.to_datetime(df.index)
     df = df.sort_index()
-    return df
 
+    if not df.index.is_unique:
+        dups = df.index[df.index.duplicated()].unique()
+        logger.warning(f"Data from {path.name} contains {len(dups)} duplicate index dates! Deduplicating by keeping the last entry per date.")
+        df = df[~df.index.duplicated(keep='last')]
+
+    return df
 def _resolve_panel_path(data_dir: Path, panel_arg: Optional[str], default_prefix: str) -> Path:
     if panel_arg:
         p = Path(panel_arg)
@@ -191,24 +212,37 @@ def _resolve_target_col(target: Optional[str], panel: pd.DataFrame, data_dir: Pa
         if resolved is not None:
             return resolved
 
-    best = panel.notna().sum().idxmax()
-    logger.warning(f"No GDP target found — using most-complete column: {best}")
-    return best
+    raise ValueError(
+        f"No valid GDP target found (tried 'GDPC1', 'GDP') and no explicit target provided. "
+        f"Please specify a target using --target. "
+        f"Available numerical columns (first 10): {list(cols[:10])}"
+    )
 
 def load_cf_panel(data_dir: Path, target: Optional[str], panel_arg: Optional[str] = None) -> tuple[pd.DataFrame, pd.Series]:
     panel_path = _resolve_panel_path(data_dir, panel_arg, "panel")
     logger.info(f"Loading CF Panel: {panel_path}")
 
     panel = _load_data_with_datetime_index(panel_path)
+    
+    # Drop known helper columns before selecting numerical dtypes
+    for helper in ["series_id", "series_key", "category"]:
+        if helper in panel.columns:
+            panel = panel.drop(columns=[helper])
+            
     panel = panel.select_dtypes(include=[np.number])
 
     if panel.empty:
         raise ValueError("Loaded panel is empty.")
 
     target_col = _resolve_target_col(target, panel, data_dir, panel_path)
+    validate_target_column(target_col)
     logger.info(f"Target: series_id={target_col}")
 
     y = panel.pop(target_col)
+    
+    validate_unique_index(panel, "CF panel (X)")
+    validate_unique_index(y, "CF panel (y)")
+    
     return panel, y
 
 def load_mf_panels(
@@ -223,14 +257,22 @@ def load_mf_panels(
     try:
         m_path = _resolve_panel_path(data_dir, panel_arg, "mf_panel_M")
         logger.info(f"Loading Monthly MF Panel: {m_path}")
-        X_m = _load_data_with_datetime_index(m_path).select_dtypes(include=[np.number])
+        X_m = _load_data_with_datetime_index(m_path)
+        for helper in ["series_id", "series_key", "category"]:
+            if helper in X_m.columns:
+                X_m = X_m.drop(columns=[helper])
+        X_m = X_m.select_dtypes(include=[np.number])
     except FileNotFoundError as e:
         logger.warning(e)
 
     try:
         q_path = _resolve_panel_path(data_dir, panel_arg, "mf_panel_Q")
         logger.info(f"Loading Quarterly MF Panel: {q_path}")
-        X_q = _load_data_with_datetime_index(q_path).select_dtypes(include=[np.number])
+        X_q = _load_data_with_datetime_index(q_path)
+        for helper in ["series_id", "series_key", "category"]:
+            if helper in X_q.columns:
+                X_q = X_q.drop(columns=[helper])
+        X_q = X_q.select_dtypes(include=[np.number])
     except FileNotFoundError as e:
         logger.warning(e)
 
@@ -238,8 +280,10 @@ def load_mf_panels(
     target_col = target
 
     if not X_q.empty and target_col and target_col in X_q.columns:
+        validate_target_column(target_col)
         y = X_q.pop(target_col)
     elif not X_m.empty and target_col and target_col in X_m.columns:
+        validate_target_column(target_col)
         y = X_m.pop(target_col)
         y = y.resample("QE").last().dropna()
     elif not X_q.empty:
@@ -259,4 +303,12 @@ def load_mf_panels(
             "Run: python scripts/data_preparation.py --mode mixed_frequency"
         )
 
+    if not X_m.empty:
+        validate_unique_index(X_m, "Monthly MF panel (X_m)")
+    if not X_q.empty:
+        validate_unique_index(X_q, "Quarterly MF panel (X_q)")
+    if not y.empty:
+        validate_unique_index(y, "MF mixed panel (y)")
+
     return X_m, X_q, y
+

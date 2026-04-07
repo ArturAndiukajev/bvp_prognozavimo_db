@@ -44,6 +44,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from nowcasting.evaluation.checkpoint import prune_grid, run_chunks, build_run_signature
 from nowcasting.utils.data_loader import load_cf_panel, _DEFAULT_DATA_DIR
 from nowcasting.evaluation.backtester import RollingBacktester
 from nowcasting.evaluation.metrics import compute_metrics
@@ -83,6 +84,8 @@ def build_parser() -> argparse.ArgumentParser:
     
     # Compute
     ap.add_argument("--n-jobs", type=int, default=1, help="Parallel workers for Grid/Staged")
+    ap.add_argument("--resume", action="store_true", help="Resume from an interrupted search using existing results CSV.")
+    ap.add_argument("--checkpoint-chunk-size", type=int, default=10, help="Save to CSV after completing this many configurations.")
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--results-dir", default="data/forecasts/tactis/", help="Directory to save experiment results")
     
@@ -158,7 +161,7 @@ def eval_tactis_config(
     seed: int,
     search_last_n_steps: int = 0,
     step_callback: Optional[callable] = None
-) -> Tuple[Dict[str, Any], pd.DataFrame]:
+) -> Dict[str, Any]:
     """
     Evaluates a specific configuration using RollingBacktester.
     Returns (metrics_dict, eval_df).
@@ -220,7 +223,8 @@ def eval_tactis_config(
         if eval_df.empty:
             res["status"] = "failed"
             res["error_message"] = "Backtester returned empty DataFrame"
-            return res, eval_df
+            res["_eval_df"] = eval_df
+            return res
 
         metrics = compute_metrics(eval_df, model_name="TACTiS")
         res["rmse"] = float(metrics["RMSE"].iloc[0])
@@ -244,7 +248,8 @@ def eval_tactis_config(
         res["runtime_sec"] = round(time.time() - t0, 2)
         logger.debug(f"Config failed [TACTiS]: {exc}", exc_info=True)
 
-    return res, eval_df
+    res["_eval_df"] = eval_df
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +304,7 @@ def optuna_objective(
         if trial.should_prune():
             raise optuna.TrialPruned(f"Optuna pruned at step {step} with RMSE: {running_rmse:.4f}")
 
-    metrics, eval_df = eval_tactis_config(
+    metrics = eval_tactis_config(
         tactis_params=tactis_params,
         selector_method=selector_name,
         selector_params=selector_params,
@@ -310,6 +315,7 @@ def optuna_objective(
         seed=args.seed,
         step_callback=_pruning_callback
     )
+    eval_df = metrics.get("_eval_df", pd.DataFrame())
 
     if metrics["status"] != "success":
         logger.debug(f"Trial failed: {metrics['error_message']}")
@@ -512,81 +518,145 @@ def run_grid_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse.N
     run_kwargs = dict(X_panel=X_panel, y_target=y_target, train_window=args.train_window, 
                       step_size=args.step_size, seed=args.seed, search_last_n_steps=args.search_last_n_steps)
     
-    if args.n_jobs > 1:
-        results_and_dfs = Parallel(n_jobs=args.n_jobs, verbose=5, prefer="processes")(
-            delayed(eval_tactis_config)(**cfg, **run_kwargs) for cfg in configs
-        )
-    else:
-        results_and_dfs = []
-        for i, cfg in enumerate(configs, 1):
-            logger.info(f"[{i}/{len(configs)}] Running {cfg['selector_method']} | history={cfg['tactis_params']['history_length']}")
-            results_and_dfs.append(eval_tactis_config(**cfg, **run_kwargs))
+    out_path = out_dir / f"tactis_grid_results_{suffix}.csv"
+    run_signature = build_run_signature(
+        script_name="run_tactis_experiment.py",
+        engine="grid",
+        input_panel=str(args.input_panel or args.data_dir),
+        target=str(args.target),
+        seed=args.seed,
+        search_last_n_steps=args.search_last_n_steps
+    )
+    configs = prune_grid(configs, args.search_last_n_steps, out_path, getattr(args, "resume", False), run_signature=run_signature)
+    
+    wrapper = lambda cfg, **kwargs: eval_tactis_config(**cfg, **kwargs)
+    results = run_chunks(configs, wrapper, run_kwargs, out_path, n_jobs=args.n_jobs, chunk_sz=getattr(args, "checkpoint_chunk_size", 10))
             
-    _process_grid_results(results_and_dfs, out_dir, suffix, "grid")
+    _process_grid_results(results, args, out_path, suffix, "grid", X_panel, y_target)
 
 def run_staged_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse.Namespace, out_dir: Path, suffix: str):
     logger.info("Starting STAGED engine.")
     configs = _build_grid_configs(args)
     
-    logger.info(f"--- Stage 1: Coarse Search ({len(configs)} configs, 3 steps) ---")
+    out_path = out_dir / f"tactis_staged_results_{suffix}.csv"
+    run_signature = build_run_signature(
+        script_name="run_tactis_experiment.py",
+        engine="staged",
+        input_panel=str(args.input_panel or args.data_dir),
+        target=str(args.target),
+        seed=args.seed,
+        search_last_n_steps=args.search_last_n_steps
+    )
     st1_steps = min(3, args.search_last_n_steps) if args.search_last_n_steps > 0 else 3
     run_kwargs = dict(X_panel=X_panel, y_target=y_target, train_window=args.train_window, 
-                      step_size=args.step_size, seed=args.seed, search_last_n_steps=st1_steps)
-                      
-    if args.n_jobs > 1:
-        st1_res = Parallel(n_jobs=args.n_jobs, verbose=5, prefer="processes")(
-            delayed(eval_tactis_config)(**cfg, **run_kwargs) for cfg in configs
-        )
+                      step_size=args.step_size, seed=args.seed)
+
+    logger.info(f"--- Stage 1: Coarse Search ({len(configs)} configs, {st1_steps} steps) ---")
+    st1_kwargs = dict(run_kwargs)
+    st1_kwargs["search_last_n_steps"] = st1_steps
+    
+    configs_s1 = prune_grid(configs, st1_steps, out_path, getattr(args, "resume", False), run_signature=run_signature)
+    wrapper = lambda cfg, **kwargs: eval_tactis_config(**cfg, **kwargs)
+    
+    st1_res = run_chunks(configs_s1, wrapper, st1_kwargs, out_path, n_jobs=args.n_jobs, chunk_sz=getattr(args, "checkpoint_chunk_size", 10), stage_name="Stage 1")
+
+    if out_path.exists():
+        try:
+            full_s1_df = pd.read_csv(out_path)
+            full_s1_df = full_s1_df[(full_s1_df["status"] == "success")]
+            best_dict_list = full_s1_df.sort_values("rmse").head(args.search_top_k).to_dict("records")
+            best_configs = []
+            for b in best_dict_list:
+                best_configs.append({
+                    "selector_method": b.get("selector_method"),
+                    "selector_params": json.loads(b.get("selector_params", "{}")) if isinstance(b.get("selector_params"), str) else b.get("selector_params"),
+                    "tactis_params": json.loads(b.get("tactis_params", "{}")) if isinstance(b.get("tactis_params"), str) else b.get("tactis_params")
+                })
+        except Exception:
+            df_st1 = pd.DataFrame([r for r in st1_res if r.get("status") == "success"])
+            if not df_st1.empty:
+                best_indices = df_st1.sort_values("rmse").index[:args.search_top_k]
+                best_configs = [configs[i] for i in best_indices]
+            else:
+                best_configs = []
     else:
-        st1_res = [eval_tactis_config(**cfg, **run_kwargs) for cfg in configs]
-        
-    df_st1 = pd.DataFrame([r[0] for r in st1_res if r[0]["status"] == "success"])
-    if df_st1.empty:
+        df_st1 = pd.DataFrame([r for r in st1_res if r.get("status") == "success"])
+        if not df_st1.empty:
+            best_indices = df_st1.sort_values("rmse").index[:args.search_top_k]
+            best_configs = [configs[i] for i in best_indices]
+        else:
+            best_configs = []
+
+    if not best_configs:
         logger.error("Stage 1 failed completely.")
         return
-        
-    top_k = min(len(df_st1), args.search_top_k)
-    df_st1 = df_st1.sort_values("rmse")
-    # Identify the best configs by looking up the original dictionary based on index alignment (simpler than dict re-matching)
-    best_indices = df_st1.index[:top_k]
-    best_configs = [configs[i] for i in best_indices]
 
-    logger.info(f"--- Stage 2: Fine Search (Top {top_k} configs, {args.search_last_n_steps} steps) ---")
-    run_kwargs["search_last_n_steps"] = args.search_last_n_steps
-    
-    if args.n_jobs > 1:
-        st2_res = Parallel(n_jobs=args.n_jobs, verbose=5, prefer="processes")(
-            delayed(eval_tactis_config)(**cfg, **run_kwargs) for cfg in best_configs
-        )
+    logger.info(f"--- Stage 2: Fine Search (Top {len(best_configs)} configs, {args.search_last_n_steps} steps) ---")
+    st2_kwargs = dict(run_kwargs)
+    st2_kwargs["search_last_n_steps"] = args.search_last_n_steps
+    best_configs = prune_grid(best_configs, args.search_last_n_steps, out_path, getattr(args, "resume", False), run_signature=run_signature)
+    st2_res = run_chunks(best_configs, wrapper, st2_kwargs, out_path, n_jobs=args.n_jobs, chunk_sz=getattr(args, "checkpoint_chunk_size", 10), stage_name="Stage 2")
+
+    _process_grid_results(st2_res, args, out_path, suffix, "staged", X_panel, y_target)
+
+def _process_grid_results(results: List[dict], args: argparse.Namespace, out_path: Path, suffix: str, engine_name: str, X_panel: pd.DataFrame, y_target: pd.Series):
+    if out_path.exists():
+        df_res = pd.read_csv(out_path)
     else:
-        st2_res = [eval_tactis_config(**cfg, **run_kwargs) for cfg in best_configs]
-        
-    _process_grid_results(st2_res, out_dir, suffix, "staged")
+        df_res = pd.DataFrame(results)
 
-def _process_grid_results(results_and_dfs: List[Tuple[dict, pd.DataFrame]], out_dir: Path, suffix: str, engine_name: str):
-    df_res = pd.DataFrame([r[0] for r in results_and_dfs])
     success = df_res[df_res["status"] == "success"]
-    
+    out_dir = out_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    res_path = out_dir / f"tactis_{engine_name}_results_{suffix}.csv"
-    df_res.to_csv(res_path, index=False)
     
     if not success.empty:
-        best_idx = success["rmse"].idxmin()
-        best_eval_df = results_and_dfs[best_idx][1] # Get df matching the best row
-        best_dict = results_and_dfs[best_idx][0]
+        df_res = df_res.sort_values("rmse").reset_index(drop=True)
         
-        preds_path = out_dir / f"tactis_{engine_name}_best_preds_{suffix}.csv"
-        best_eval_df.to_csv(preds_path, index=False)
+        best_cfg = df_res.iloc[0].to_dict()
+        memory_res = [r for r in results if r.get("_config_id") == best_cfg.get("_config_id")]
+        if memory_res and "_eval_df" in memory_res[0]:
+            best_eval_df = memory_res[0]["_eval_df"]
+        else:
+            logger.info("Re-evaluating best configuration to regenerate predictions output...")
+            wrapper = lambda cfg, **kwargs: eval_tactis_config(**cfg, **kwargs)
+            try:
+                b_run_kwargs = dict(X_panel=X_panel, y_target=y_target, train_window=args.train_window, step_size=args.step_size, seed=args.seed, search_last_n_steps=args.search_last_n_steps)
+                sp = best_cfg.get("selector_params", "{}")
+                tp = best_cfg.get("tactis_params", "{}")
+                bc = {
+                    "selector_method": best_cfg.get("selector_method"),
+                    "selector_params": json.loads(sp) if isinstance(sp, str) else sp,
+                    "tactis_params": json.loads(tp) if isinstance(tp, str) else tp
+                }
+                b_res = wrapper(bc, **b_run_kwargs)
+                best_eval_df = b_res.get("_eval_df", pd.DataFrame())
+            except Exception as e:
+                logger.error(f"Failed to cleanly re-evaluate best preds for {engine_name}: {e}")
+                best_eval_df = pd.DataFrame()
         
+        if not best_eval_df.empty:
+            preds_path = out_dir / f"tactis_{engine_name}_best_preds_{suffix}.csv"
+            best_eval_df.to_csv(preds_path, index=False)
+            
         cfg_path = out_dir / f"tactis_{engine_name}_best_config_{suffix}.json"
         with open(cfg_path, 'w') as f:
-            json.dump(best_dict, f, indent=4)
+            bd = dict(best_cfg)
+            for json_col in ("selector_params", "tactis_params"):
+                if isinstance(bd.get(json_col), str):
+                    try: bd[json_col] = json.loads(bd[json_col])
+                    except: pass
+            bd.pop("_eval_df", None)
+            json.dump(bd, f, indent=4)
         
-        logger.info(f"Top Grid Result RMSE: {best_dict['rmse']:.4f}")
+        logger.info(f"Top {engine_name.capitalize()} Result RMSE: {best_cfg['rmse']:.4f}")
         logger.info(f"Saved artifacts to {out_dir}")
+        
     else:
-        logger.error("All grid configs failed.")
+        logger.error(f"All {engine_name} configs failed.")
+        
+    if "_eval_df" in df_res.columns:
+        df_res = df_res.drop(columns=["_eval_df"])
+    df_res.to_csv(out_path, index=False)
 
 
 # ---------------------------------------------------------------------------

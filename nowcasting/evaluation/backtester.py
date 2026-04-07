@@ -78,6 +78,11 @@ class RollingBacktester:
             logger.warning("Backtester: empty X_panel or y_target.")
             return pd.DataFrame()
 
+        if not X_panel.index.is_unique:
+            raise ValueError("Backtester received X_panel with duplicate dates.")
+        if not y_target.index.is_unique:
+            raise ValueError("Backtester received y_target with duplicate dates.")
+
         if self.eval_mode == "mixed_frequency":
             return self._backtest_mixed_frequency(
                 model=model,
@@ -486,6 +491,10 @@ class RollingBacktester:
             out = out[["Predicted"]]
         else:
             out = preds.to_frame(name="Predicted")
+
+        if not out.index.is_unique:
+            dups = out.index[out.index.duplicated()].unique()
+            raise ValueError(f"Model predictions contain duplicate dates! Cannot reindex cleanly. Duplicates: {list(dups[:3])}...")
 
         if eval_mode == "common_frequency":
             if not out.index.equals(target_index):

@@ -361,7 +361,7 @@ def save_signature_cache(out_dir: Path, current_cache: dict, new_reports: list):
     
     # Update the dictionary with new successful runs
     for diag in new_reports:
-        if diag.get("dropped_reason") is None: # Only cache successful series
+        if normalize_dropped_reason(diag.get("dropped_reason")) is None: # Only cache successful series
             sid_str = str(diag["series_id"])
             current_cache[sid_str] = {
                 "obs_count": diag["initial_non_nan"],
@@ -1654,6 +1654,20 @@ def main() -> None:
             min_dt_str = min_dt.strftime("%Y-%m-%d") if min_dt else None
             max_dt_str = max_dt.strftime("%Y-%m-%d") if max_dt else None
             
+            # --- WIDE PANEL SAVING (CF) ---
+            try:
+                wide_panel = safe_consolidate_panels(chk.chk_dir, "panel_chunk_*.parquet")
+                if not wide_panel.empty:
+                    validate_panel(wide_panel, label="final_wide_panel")
+                    out_path = out_dir / f"panel_{run_suffix}.parquet"
+                    wide_panel.to_parquet(out_path)
+                    logger.info(f"Saved wide panel for modeling: {out_path}")
+                    del wide_panel
+                    gc.collect()
+            except Exception as e:
+                logger.warning(f"Could not save wide CF panel: {e}")
+            # ------------------------------
+            
             summary_dict = _log_prep_summary(
                 label="[CF]", 
                 total_series_metadata=total_series, 
@@ -1688,6 +1702,20 @@ def main() -> None:
                     chunk_long.to_parquet(partitioned_dir, engine='pyarrow', index=False, partition_cols=['provider'])
                 
                 summary_dicts[f"freq_{freq}"] = {"kept_series": kept_series_count}
+
+                # --- WIDE PANEL SAVING (MF) ---
+                try:
+                    wide_panel = safe_consolidate_panels(chk.chk_dir, f"mf_panel_{freq}_chunk_*.parquet")
+                    if not wide_panel.empty:
+                        validate_panel(wide_panel, label=f"final_mf_wide_{freq}")
+                        out_path = out_dir / f"mf_panel_{freq}_{run_suffix}.parquet"
+                        wide_panel.to_parquet(out_path)
+                        logger.info(f"Saved wide panel for modeling: {out_path}")
+                        del wide_panel
+                        gc.collect()
+                except Exception as e:
+                    logger.warning(f"Could not save wide MF panel for freq {freq}: {e}")
+                # ------------------------------
 
             global_summary = _log_prep_summary(
                 label="[MF_ALL]", 
