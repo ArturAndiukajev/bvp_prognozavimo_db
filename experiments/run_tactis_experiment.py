@@ -74,8 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # General
-    ap.add_argument("--engine", choices=["optuna", "grid", "staged"], default="optuna",
-                    help="Search engine to use: optuna (Bayesian), grid (exhaustive), staged (coarse-to-fine)")
+    ap.add_argument("--engine", choices=["optuna", "grid", "staged", "evaluate"], default="optuna",
+                    help="Search engine to use: optuna, grid, staged, or evaluate (single run from config)")
     ap.add_argument("--data-dir", default=_DEFAULT_DATA_DIR)
     ap.add_argument("--input-panel", default=None)
     ap.add_argument("--target-col", default=None, dest="target")
@@ -88,6 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--checkpoint-chunk-size", type=int, default=10, help="Save to CSV after completing this many configurations.")
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--results-dir", default="data/forecasts/tactis/", help="Directory to save experiment results")
+    ap.add_argument("--config-path", type=str, default=None, help="Path to a JSON configuration file for '--engine evaluate'")
     
     # Optuna Specific
     ap.add_argument("--n-trials", type=int, default=50, help="Number of trials for Optuna engine")
@@ -468,6 +469,99 @@ def run_optuna_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse
     trials_df.to_csv(trials_filepath, index=False)
 
 
+def run_evaluation_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse.Namespace, out_dir: Path, suffix: str):
+    if not args.config_path:
+        logger.error("Evaluation mode requires '--config-path'.")
+        return
+
+    config_path = Path(args.config_path)
+    if not config_path.exists():
+        logger.error(f"Config file not found: {args.config_path}")
+        return
+
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    # Robust parsing of nested JSON strings if present (often happens in results CSV exports)
+    def _parse_if_str(val):
+        if isinstance(val, str):
+            try: return json.loads(val)
+            except: return val
+        return val
+
+    # Extract configuration parts
+    eval_config = {}
+    for k, v in config.items():
+        if k not in ["rmse", "mae", "mape", "status", "runtime_sec", "n_eval_points", "n_folds", "error_message", "n_raw_features", "n_trans_features", "n_sel_features", "n_model_used_vars"]:
+            eval_config[k] = _parse_if_str(v)
+    
+    # Standardize result file path
+    out_path = out_dir / "tactis_experiment_results.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    logger.info(f"Evaluating TACTiS with config from {args.config_path}")
+    
+    # Wrap in single-item grid for checkpoint system
+    search_grid = [eval_config]
+    
+    run_signature = build_run_signature(
+        script_name="run_tactis_experiment.py",
+        input_panel=str(args.input_panel or args.data_dir),
+        target=str(y_target.name),
+        seed=args.seed,
+        search_last_n_steps=args.search_last_n_steps,
+        engine="evaluate"
+    )
+    
+    # Reuse shared partial evaluator
+    def eval_tactis_config_partial(cfg: dict, **kwargs):
+        t_params = json.loads(cfg["tactis_params"]) if isinstance(cfg["tactis_params"], str) else cfg["tactis_params"]
+        s_method = cfg.get("selector_method", "none")
+        s_params = json.loads(cfg["selector_params"]) if isinstance(cfg["selector_params"], str) else cfg.get("selector_params", {})
+        
+        return eval_tactis_config(
+            tactis_params=t_params,
+            selector_method=s_method,
+            selector_params=s_params,
+            **kwargs
+        )
+    
+    run_kwargs = dict(
+        X_panel=X_panel,
+        y_target=y_target,
+        train_window=args.train_window,
+        step_size=args.step_size,
+        seed=args.seed,
+        search_last_n_steps=args.search_last_n_steps
+    )
+    
+    pruned_grid = prune_grid(search_grid, args.search_last_n_steps, out_path, resume=args.resume, run_signature=run_signature)
+    
+    if not pruned_grid:
+        logger.info("Evaluation already completed and found in results CSV. Skipping.")
+        return
+
+    results = run_chunks(pruned_grid, eval_tactis_config_partial, run_kwargs, out_path, n_jobs=1, chunk_sz=1, stage_name="Evaluation")
+    
+    if results and results[0]["status"] == "success":
+        res = results[0]
+        logger.info(f"Evaluation Success | RMSE: {res['rmse']:.4f} | MAE: {res['mae']:.4f}")
+        eval_df = res.pop("_eval_df", pd.DataFrame())
+        if not eval_df.empty:
+            out_preds = out_dir / f"tactis_eval_preds_{suffix}.csv"
+            eval_df.to_csv(out_preds, index=False)
+            logger.info(f"Saved predictions to {out_preds}")
+        
+        # Also save separate JSON for convenience
+        out_json = out_dir / f"tactis_eval_results_{suffix}.json"
+        with open(out_json, "w") as f:
+            json.dump({k: v for k, v in res.items() if k != "_eval_df"}, f, indent=4)
+        logger.info(f"Saved results to {out_json}")
+    else:
+        err = results[0].get("error_message") if results else "Unknown error"
+        logger.error(f"Evaluation failed: {err}")
+
+
 # ---------------------------------------------------------------------------
 # Grid / Staged Engines
 # ---------------------------------------------------------------------------
@@ -693,6 +787,8 @@ def main() -> None:
         run_grid_engine(X_panel, y_target, args, out_dir, suffix)
     elif args.engine == "staged":
         run_staged_engine(X_panel, y_target, args, out_dir, suffix)
+    elif args.engine == "evaluate":
+        run_evaluation_engine(X_panel, y_target, args, out_dir, suffix)
 
 
 

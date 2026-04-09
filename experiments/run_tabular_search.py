@@ -182,8 +182,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--search-top-k", type=int, default=5)
 
     # ---------- Optuna ----------
-    ap.add_argument("--engine", choices=["optuna", "grid", "staged"], default=None,
-                    help="Search engine to use: optuna (Bayesian), grid (exhaustive), staged (coarse-to-fine)")
+    ap.add_argument("--engine", choices=["optuna", "grid", "staged", "evaluate"], default=None,
+                    help="Search engine to use: optuna, grid, staged, or evaluate (single run from config)")
+    ap.add_argument("--config-path", type=str, default=None, help="Path to a JSON configuration file for '--engine evaluate'")
     ap.add_argument("--n-trials", type=int, default=50, help="Number of trials for Optuna engine")
     ap.add_argument("--study-storage", type=str, default=None, 
                     help="Optuna storage URI (e.g. sqlite:///tabular.db). Defaults to sqlite in results directory.")
@@ -613,6 +614,83 @@ def run_optuna_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse
     except ValueError:
         logger.warning("No successful trials completed.")
 
+
+def run_evaluation_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse.Namespace, out_dir: Path, suffix: str):
+    if not args.config_path:
+        logger.error("Evaluation mode requires '--config-path'.")
+        return
+
+    config_path = Path(args.config_path)
+    if not config_path.exists():
+        logger.error(f"Config file not found: {args.config_path}")
+        return
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    # Robust parsing of nested JSON strings (e.g. from results CSV exports)
+    def _parse_if_str(val):
+        if isinstance(val, str):
+            try: return json.loads(val)
+            except: return val
+        return val
+
+    # Extract configuration parts
+    eval_config = {}
+    for k, v in config.items():
+        if k not in ["rmse", "mae", "mape", "status", "runtime_sec", "n_eval_points", "n_folds", "error_message", "n_features_used", "n_raw_features", "n_trans_features", "n_sel_features", "n_model_used_vars"]:
+            eval_config[k] = _parse_if_str(v)
+
+    logger.info(f"Evaluating Tabular with config from {args.config_path}")
+    
+    # Wrap in single-item grid for checkpoint system
+    search_grid = [eval_config]
+    
+    run_signature = build_run_signature(
+        script_name="run_tabular_search.py",
+        input_panel=str(args.input_panel or args.data_dir),
+        target=str(args.target),
+        seed=args.seed,
+        search_last_n_steps=args.search_last_n_steps,
+        search_strategy=args.search_strategy,
+        models=args.models,
+        engine="evaluate"
+    )
+    
+    out_path = Path(args.results_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pruned_grid = prune_grid(search_grid, args.search_last_n_steps, out_path, resume=args.resume, run_signature=run_signature)
+    
+    if not pruned_grid:
+        logger.info("Evaluation already completed and found in results CSV. Skipping.")
+        return
+
+    run_kwargs = dict(
+        X_panel=X_panel,
+        y_target=y_target,
+        search_last_n_steps=args.search_last_n_steps,
+        seed=args.seed,
+    )
+
+    results = run_chunks(pruned_grid, run_single_experiment, run_kwargs, out_path, n_jobs=1, chunk_sz=1, stage_name="Evaluation")
+    
+    if results and results[0]["status"] == "success":
+        res = results[0]
+        logger.info(f"Evaluation Success | RMSE: {res['rmse']:.4f} | MAE: {res['mae']:.4f}")
+        eval_df = res.pop("_eval_df", pd.DataFrame())
+        if not eval_df.empty:
+            out_preds = out_dir / f"tabular_eval_preds_{suffix}.csv"
+            eval_df.to_csv(out_preds, index=False)
+            logger.info(f"Saved predictions to {out_preds}")
+        
+        out_json = out_dir / f"tabular_eval_results_{suffix}.json"
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump({k: v for k, v in res.items() if k != "_eval_df"}, f, indent=4, default=str)
+        logger.info(f"Saved results to {out_json}")
+    else:
+        err = results[0].get("error_message") if results else "Unknown error"
+        logger.error(f"Evaluation failed: {err}")
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -654,6 +732,10 @@ def main() -> None:
 
     if active_engine == "optuna":
         run_optuna_engine(X_panel, y_target, args, out_path.parent, suffix_base)
+        return
+
+    if active_engine == "evaluate":
+        run_evaluation_engine(X_panel, y_target, args, out_path.parent, suffix_base)
         return
 
     # Fallback to standard grid/staged below...
