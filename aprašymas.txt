@@ -1,0 +1,920 @@
+================================================================================
+PROJEKTO FAILŲ GIDAS (PROJECT FILE GUIDE)
+================================================================================
+
+Šis gidas suteikia išsamią svarbiausių projekto failų apžvalgą. Jis skirtas tiems,
+kurie prižiūrės, modifikuos arba testuos „nowcasting“ (trumpalaikio prognozavimo)
+sistemą. Sistema geba apdoroti mišraus dažnio makroekonominius duomenis, griežtai
+testuoti modelius be duomenų nutekėjimo (angl. look-ahead bias) bei lyginti skirtingas
+prognozavimo metodologijas (DFM, BVAR, regresijas, MIDAS, giliojo mokymosi modelius)
+naudojant lygiagretų hiperparametrų optimizavimą.
+
+--------------------------------------------------------------------------------
+KAIP NAUDOTIS ĮRANKIU (ŽINGSNIS PO ŽINGSNIO)
+--------------------------------------------------------------------------------
+Norint sėkmingai paruošti ir naudoti „nowcasting“ sistemą, rekomenduojama laikytis
+šios veiksmų sekos:
+
+1. APLINKOS KONFIGŪRAVIMAS.
+   - Sukurkite PostgreSQL duomenų bazę (pvz., `nowcast_db`).
+   - Užpildykite `.env` failą (nurodykite DB_URL, API raktus, jei reikia).
+
+2. SCHEMOS SUKŪRIMAS.
+   - Pirmas žingsnis – inicializuoti lenteles duomenų bazėje.
+   - PALEIDIMAS: `python create_schema.py`
+   - *Pastaba: Ši komanda ištrina visus esamus duomenis bazėje.*
+
+3. DUOMENŲ ATSIUNTIMAS (INITIAL INGEST).
+   - Užpildykite tuščią bazę istoriniais duomenimis iš visų tiekėjų (Eurostat, FRED ir kt.).
+   - PALEIDIMAS: `python run_ingest.py --mode initial`
+
+4. REGULIARŪS DUOMENŲ ATNAUJINIMAI.
+   - Kasdieniam ar savaitiniam naujausių duomenų papildymui naudokite:
+   - PALEIDIMAS: `python run_updates.py`
+
+5. DUOMENŲ PARUOŠIMAS MODELIAVIMUI.
+   - Sujunkite visas laiko eilutes į vieną panelį, sutvarkykite stacionarumą ir transformacijas.
+   - PALEIDIMAS: `python scripts/data_preparation.py --mode common_frequency --target BVP_SA`
+   - Tai sukurs apdorotus failus (pvz., .parquet) `data/processed/` kataloge.
+
+6. EKSPERIMENTŲ VYKDYMAS.
+   - Paleiskite modelių hiperparametrų paiešką ar backtesting'ą.
+   - PALEIDIMAS: `python experiments/run_tabular_search.py --engine staged` (arba kiti runner'iai).
+
+7. REZULTATŲ ANALIZĖ (DASHBOARD).
+   - Naudokite vizualizacijos įrankį prognozėms ir metrikoms stebėti.
+   - PALEIDIMAS: `streamlit run dashboard.py`
+
+--------------------------------------------------------------------------------
+KAIP VEIKIA ŠIS PROJEKTAS? (BENDRA DUOMENŲ IR PROCESŲ EIGA)
+--------------------------------------------------------------------------------
+Prieš pradedant analizuoti atskirus failus, svarbu suprasti, kaip duomenys keliauja
+projekto viduje (koks yra bendras "pipeline"):
+
+1. DUOMENŲ ATSISIUNTIMAS (ETL FAZĖ).
+   - Skriptai (`run_updates.py`, `run_ingest.py`, `load_new_source.py`) parsisiunčia
+     žalius duomenis iš Eurostat, FRED, Yahoo Finance ir kitų API.
+   - Šie neapdoroti duomenys (.csv/.json) išsaugomi `data/raw/` kataloge, o vėliau
+     sukeliami į PostgreSQL duomenų bazę.
+   - KAIP PALEISTI: `python run_updates.py`
+
+2. DUOMENŲ PARUOŠIMAS MODELIAMS.
+   - Duomenų bazėje esančios DB lentelių eilutės nėra iš karto tinkamos modeliams. Tuomet
+     naudojamas pagrindinis paruošimo skriptas. Jis sujungia datas (Pivot), sinchronizuoja ir
+     užpildo trūkstamas reikšmes, kad modeliai turėtų su kuo mokytis.
+   - Išvestis – sugeneruoti apdoroti failai `data/processed/` kataloge (pvz. parquet formatais).
+   - KAIP PALEISTI: `python scripts/data_preparation.py --mode common_frequency --target BVP_SA`
+
+3. MODELIŲ TRENIRAVIMAS IR TESTAVIMAS.
+   - Paruošti duomenys paduodami į eksperimentų runner'ius iš `experiments/` katalogo.
+   - Runner'iai treniruoja modelį pagal visą istoriją slenkančiu (backtesting) rėžimu:
+     * `staged` / `grid` varikliai ieško geriausių nustatymų.
+     * `evaluate` variklis testuoja 1 konkretų modelį iš nurodyto .json failo.
+   - Rezultatai, metrikos ir prognozės išsaugomi `data/forecasts/`.
+   - SISTEMOS TĘSTINUMAS (Checkpointing): Visi eksperimentai palaiko `--resume` funkciją, 
+     leidžiančią tęsti nutrūkusį skaičiavimą arba praleisti jau atliktus testus.
+   - KAIP PALEISTI: `python experiments/run_tabular_search.py --models lightgbm --engine staged`
+
+4. VARTOTOJO SĄSAJA (DASHBOARD).
+   - Naršyklėje veikiantis dashboard'as apjungia visas projekto dalis: skaito failus iš `data/forecasts/` 
+     grafikams brėžti, stebi sistemos būklę naršyklėje tiesiai iš PostgreSQL.
+   - KAIP PALEISTI: `streamlit run dashboard.py`
+
+--------------------------------------------------------------------------------
+PART 1: DATA PREPARATION & EVALUATION
+--------------------------------------------------------------------------------
+
+File: scripts/data_preparation.py
+------------------------------------
+Paskirtis: Automatizuoja duomenų valymą, transformaciją ir agregavimą į tvarkingus
+parquet panelinius failus.
+Vaidmuo pipeline: Tai pirmasis etapas. Modeliai naudoja būtent čia sugeneruotus
+parquet failus. Šis failas užtikrina, kad eilutės būtų stacionarios ir tvarko
+trūkstamas reikšmes.
+Numatytieji parametrai:
+    mode: PrepMode = PrepMode.COMMON_FREQUENCY
+    min_obs: int = 8
+    fill_internal_limit: int = 3
+    impute_ragged_edges: bool = False
+    ragged_edges_limit: int = 4
+
+    # Fast Mode & Scalability
+    fast_mode: bool = False
+    allowed_frequencies: str = "D,W,M,Q,A"
+    seasonality_mode: str = "full"      # 'full', 'fast', 'metadata_only'
+    report_level: str = "full"          # 'full', 'compact'
+    prefilter_max_series: Optional[int] = None
+
+    # Common-frequency options
+    target_freq: str = "ME"
+    daily_weekly_rule: str = "mean"
+
+    # Stationarity (common-frequency)
+    use_yoy: bool = True
+    kpss_alpha: float = 0.05
+    max_diffs: int = 2
+
+    # Stationarity (mixed-frequency stationarity (lighter)
+    mf_max_diffs: int = 1
+    mf_use_log_diff: bool = True      # use log-diff(1) instead of YoY for MF
+
+    # New Requirements
+    min_span_years: float = 14.0      # Minimum span between first and last valid observation
+
+    # Execution
+    use_multiprocess: bool = False
+    n_workers: int = min(os.cpu_count() or 4, 16)
+
+    # Checkpointing & Scalability
+    chunk_size: int = 1000
+    resume_from_checkpoint: bool = False
+    debug: bool = False
+Ką reiškia šie numatytieji parametrai:
+- `mode`: `common_frequency` visiškai peragreguoja visą duomenų masyvą į atitinkamą
+ `target_freq` (pvz. ME - mėnesinį) dažnį.
+ `mixed_frequency` palieka originalius dažnius tokiems modeliams kaip MIDAS.
+- `ragged_edges_limit` / `impute_ragged_edges`: Tvarko „ragged edges“ problemą išmaniai
+ užpildant oficialių publikacijų atsilikimų spragas failo pabaigoje.
+- `fast_mode`: Įjungus jį apdorojimas paspartėja dešimtimis kartų praleidžiant gilius
+ stacionarumo testus ar sunkų sezoniškumo derinimą. Idealus pasirinkimas dideliems
+ atrankos grid'ams.
+- `use_yoy`, `kpss_alpha`, `max_diffs`: Stacionarizacijos variklis. Visi duomenys
+ automatiškai persukami per KPSS testą, o jei jie ne stacionarūs – sistemingai taikomi
+skirtumai (iki max_diffs), kol atitinka kpss_alpha lygį.
+- `min_span_years`: Jeigu po trūkstamų duomenų išmetimo eilutė turi mažiau nei
+nurodyta metų istorijos, ji atmetama, siekiant modeliams palikti tik aukštos
+kokybės ilgalaikes eilutes.
+- `resume_from_checkpoint` bei `chunk_size`: Atminties (RAM) pritrūkimo sprendimas.
+Didžiuliai laiko eilučių masyvai yra skaidomi į mažus blokus (chunks). Kiekvienas
+apdorotas blokas fone išsaugomas per `.parquet` tarpinėje direktorijoje. Jei apdorojimas
+netyčia „nulūžta“, su `resume_from_checkpoint` komanda jį galima tęsti praleidžiant jau
+turimus duomenis.
+Saugu keisti: `fast_mode` greitam ir resursų neeikvojančiam derinimui. `n_workers` bei
+`chunk_size` norint pritaikyti kodą kompiuterio sisteminiams pajėgumams.
+Keisti atsargiai: `min_span_years`. Jį sumažinus pamaitintų duomenų kiekis
+padidės, bet sutrumpės laiko rėžyje, kas drastiškai iškreipia backtesting metrikas.
+Paleidimo pavyzdžiai:
+python scripts/data_preparation.py --mode common_frequency --fast-mode
+python scripts/data_preparation.py --resume-from-checkpoint
+Svarbios pastabos: Naudojant perskirstytą atminties arhitektūrą
+("streaming/checkpointing"), dabar ši „data_preparation“ sistema gali apdoroti
+absoliučiai gigantišką masyvą duomenų vengiant "Out Of Memory" (OOM) klaida.
+
+-----------------------------------------
+File: nowcasting/evaluation/backtester.py
+------------------------------------
+Paskirtis: Atlieka out-of-sample forward-rolling istorinius modelių vertinimus.
+Vaidmuo pipeline: Tai griežtas evaluatorius, užtikrinantis, kad
+nebūtų duomenų nutekėjimo. Jis iteratyviai plečia arba stumia treniravimo langą,
+apmoko transformacijas ir selector’ius, treniruoja modelį ir tuomet vertina
+prognozes už treniravimo ribų.
+Numatytieji parametrai:
+--initial_train_periods: 120
+--step_size: 1
+--window_type: 'expanding'
+--eval_mode: 'common_frequency'
+Ką reiškia šie numatytieji parametrai: Vertinimas pradedamas po pirmų 120 periodų
+treniravimo. Tada langas juda po 1 periodą, vis plėsdamas treniravimo aibę,
+o ne naudodamas fiksuotą slenkantį langą.
+Saugu keisti: step_size (pvz., nustatyti 3, jei nori mažiau prognozavimo taškų
+ir greitesnio vykdymo), initial_train_periods (didinti, jei modeliai
+pradžioje per lengvai persimoko).
+Keisti atsargiai: window_type (perjungus į 'rolling', sudėtingi modeliai
+gali neturėti pakankamai istorinių duomenų stabiliems parametrams;
+DFM/BVAR dažnai mėgsta expanding).
+Naudojimo pavyzdys (naudojamas skriptų viduje):
+bt = RollingBacktester(initial_train_periods=120, step_size=3)
+eval_df = bt.backtest(model, X_panel, y_target, feature_selector=selector)
+Svarbios pastabos: Automatiškai seka feature reduction
+etapus (raw -> transformed -> selected -> used_by_model) ir perduoda šią
+informaciją runner’iams.
+
+---------------------------------------
+File: nowcasting/evaluation/metrics.py
+------------------------------------
+Paskirtis: Apskaičiuoja standartinius prognozių kokybės rodiklius.
+Vaidmuo pipeline: Priima eval_df, kurį sugeneruoja Backtester,
+ir grąžina galutinius RMSE, MAE ir MAPE rodiklius rezultatų suvestinei.
+Numatytieji parametrai: Tiesiogiai per CLI nekonfigūruojami.
+Tikimasi DataFrame su Actual ir Predicted stulpeliais.
+Saugu keisti: Galima pridėti papildomus rodiklius
+Svarbios pastabos: MAPE gali tapti labai didelis, jei Actual reikšmės
+yra 0 arba labai arti 0.
+
+
+
+-------------------------------------------
+File: nowcasting/evaluation/checkpoint.py
+------------------------------------
+Paskirtis: Užtikrina eksperimentų tęstinumą ir rezultatų vientisumą.
+Vaidmuo pipeline: Prieš pat kiekvieną modelio paleidimą Checkpointer’is
+sugeneruoja unikalų MD5 atspaudą (hash) konfigūracijai. Jei toks atspaudas
+jau egzistuoja rezultatų CSV faile, skaičiavimas praleidžiamas.
+Svarbios funkcijos:
+- `prune_grid`: Išbraukia iš sąrašo tuos modelius, kurie jau yra baigti.
+- `validate_resume_signature`: Tikrina, ar bandoma tęsti lygiai tokį patį
+  eksperimentą (pvz. ar nepasikeitė target kintamasis ar duomenų failas).
+- `run_chunks`: Vykdo skaičiavimus blokais ir iš karto po kiekvieno bloko
+  įrašo rezultatus į diską, apsaugodamas nuo duomenų praradimo lūžio atveju.
+Svarbios pastabos: Sukuria `.manifest.json` failus šalia rezultatų, kuriuose
+saugoma „eksperimento parašas“ (geografija, laiko langai, sėkla).
+
+--------------------------------------------------------------------------------
+PART 2: CORE MODELS
+--------------------------------------------------------------------------------
+
+File: nowcasting/models/base.py
+------------------------------------
+Paskirtis: Apibrėžia abstrakčią BaseNowcastModel Python klasę.
+Vaidmuo pipeline: Užtikrina bendrą, į scikit-learn panašią sąsają
+(fit, predict, evaluate) visiems modeliams, todėl runner skriptai gali būti moduliniai.
+Numatytieji parametrai:
+horizon: 1
+Ką reiškia šis numatytasis parametras: Prognozuojamas tiksliai 1 dažnio
+periodas į priekį (pvz., kitas ketvirtis).
+Saugu keisti: Validacijos logiką, jei tai daroma paveldėtose klasėse.
+Naudojimo pavyzdys: Netaikoma, nes ši klasė skirta paveldėjimui.
+Svarbios pastabos: Inicializuoja modelio logger’į ir
+atlieka bazinius parametrų patikrinimus.
+
+
+------------------------------------
+File: nowcasting/models/dfm.py
+------------------------------------
+Paskirtis: Įgyvendina standartinius ir mišraus dažnio Dynamic Factor Models.
+Vaidmuo pipeline: Tai parametrinis baseline modelis,
+kuris iš šimtų eilučių išskiria latentinius bendrus faktorius ir prognozuoja BVP
+naudodamas Kalman Filter.
+Numatytieji parametrai:
+--k_factors: 1
+--factor_order: 1
+--maxiter: 200
+Ką reiškia šie numatytieji parametrai: Daroma prielaida, kad yra 1 latentinis
+ekonominis faktorius su AR(1) dinamika. maxiter nurodo maksimalų EM algoritmo
+iteracijų skaičių.
+Saugu keisti: k_factors (pvz., bandyti 2 ar 3, kad modelis sugautų skirtingus
+ekonominius sektorius), maxiter (sumažinti iki 50 greitam testavimui).
+Keisti atsargiai: factor_order. Didesnės reikšmės gali stipriai destabilizuoti
+state-space kovariacines matricas ir sukelti singular matrix problemas.
+Naudojimo pavyzdys:
+model = DynamicFactorNowcast("BVP", k_factors=2, factor_order=1)
+
+------------------------------------
+File: nowcasting/models/bvar.py
+------------------------------------
+Paskirtis: Įgyvendina Frequentist VAR ir Bayesian Vector Autoregressions.
+Vaidmuo pipeline: Tiesiogiai modeliuoja bendrą kintamųjų dinamiką laike.
+Naudoja Minnesota prior, kuris stipriai sutraukia dideles sistemas link random walk,
+taip sumažindamas over-parameterization.
+Numatytieji parametrai:
+--mode: 'bvar'
+--lags: 1
+--lambda1: 0.1 (bendras shrinkage)
+--lambda2: 0.5 (cross-variable shrinkage)
+--lambda3: 1.0 (lag decay)
+--max_vars: 30
+Ką reiškia šie numatytieji parametrai: lambda1 reguliuoja bendrą suspaudimo stiprumą;
+kuo mažesnė reikšmė, tuo stipresnis traukimas link nulio. lambda2 reiškia,
+kad kitų kintamųjų istorija laikoma mažiau patikima nei paties target istorija.
+max_vars uždeda kietą viršutinę ribą sistemos dydžiui, kad būtų išvengta atminties
+problemų ir singular matrix klaidų.
+Saugu keisti: lags (didinimas nėra labai brangus, bet mažina laisvės laipsnius),
+lambda1 (galima bandyti net 0.01 tankioms panelėms).
+Keisti atsargiai: max_vars. Jei nustatysi > 50, analitinis posterior skaičiavimas gali
+smarkiai išauginti RAM naudojimą arba sugesti.
+Naudojimo pavyzdys:
+model = BVARNowcast("BVP", mode="bvar", lags=2, lambda1=0.2, max_vars=40)
+Svarbios pastabos: Prognozė vykdoma rekursyviai žingsnis po žingsnio į priekį,
+neatnaujinant X_test konteksto.
+
+-------------------------------------
+File: nowcasting/models/midas.py
+------------------------------------
+Paskirtis: Įgyvendina U-MIDAS, kuris tiesiogiai regresuoja žemo dažnio
+target į aukšto dažnio lagus.
+Vaidmuo pipeline: Pagrindinis mišraus dažnio modelis. Leidžia nenaudoti
+agregavimo, nes aukšto dažnio lagai paverčiami į plokščius feature stulpelius.
+Numatytieji parametrai:
+--n_lags: 1
+--freq_ratio: None (automatinis nustatymas)
+--fill_strategy: 'zero'
+--regression_model: 'elasticnet'
+Ką reiškia šie numatytieji parametrai: Sukuriamas 1 atitinkamas aukšto dažnio lagų
+langas kiekvienam žemo dažnio žingsniui. Aukšto ir žemo dažnio santykis
+apskaičiuojamas automatiškai. Trūkstamos galinės reikšmės pakeičiamos 0.0.
+Saugu keisti: fill_strategy (pvz., bandyti 'ffill_then_zero'), n_lags (iki 3 ar 4).
+Keisti atsargiai: regression_model. Nors palaikomi 'ridge', 'lasso', 'linear',
+būtent 'elasticnet' dažnai apsaugo nuo kolinearumo, kuris atsiranda
+dėl lag stacking.
+Naudojimo pavyzdys:
+model = MIDASNowcast("BVP", n_lags=3, regression_model="elasticnet")
+Svarbios pastabos: Jei duomenys tankūs ir feature skaičius viršija stebėjimų
+skaičių, paprasta tiesinė regresija gali labai stipriai overfit’inti.
+
+-------------------------------------------
+File: nowcasting/models/bridge_equation.py
+------------------------------------
+Paskirtis: 2 etapų mišraus dažnio integracija. Pirmiausia užpildo ragged edges,
+tada vykdo agreguotą regresiją.
+Vaidmuo pipeline: Klasikinis ekonometrinis nowcasting metodas. Tvarko „staggered
+releases“, prognozuodamas pagrindinius mėnesinius rodiklius iki ketvirčio ribos
+naudodamas AR modelius.
+Numatytieji parametrai:
+--ar_lags: 1
+--agg_rule: 'mean'
+--regression_model: 'elasticnet'
+Ką reiškia šie numatytieji parametrai: Naudoja AR(1), kad užpildytų trūkstamas
+aukšto dažnio vietas. Mėnesinės reikšmės agreguojamos į ketvirčius paprastu vidurkiu.
+Saugu keisti: agg_rule (kai kuriems duomenims gali labiau tikti 'sum' arba 'last').
+Keisti atsargiai: Nėra itin pavojingų parametrų, tačiau reikia stebėti vykdymo laiką,
+jei naudojamos labai didelės feature aibės kartu su sunkesniais ElasticNetCV gridais.
+Naudojimo pavyzdys:
+model = BridgeEquationNowcast("BVP", ar_lags=2, agg_rule="last")
+Svarbios pastabos: Automatiškai naudoja StandardScaler, kad suvaldytų skirtingus
+feature mastelius prieš CV regresijas.
+
+----------------------------------------
+File: nowcasting/models/ml_regression.py
+------------------------------------
+Paskirtis: ML baziniai modeliai, veikiantys su vienodo dažnio paneliniais duomenimis.
+Vaidmuo pipeline: Pateikia patikimą, jokiomis griežtomis prielaidomis neparemtą funkcionalumą
+sureguliuoti algoritmą nuo X kintamųjų iki Y tikslo (BVP). Naudoja LightGBM ir
+ElasticNet.
+Numatytieji parametrai:
+ElasticNetCV: l1_ratio=0.5, cv=5, max_iter=2000, fill_strategy='zero'
+LightGBM: n_estimators=100, learning_rate=0.05
+Ką reiškia šie numatytieji parametrai: l1_ratio=0.5 tobulai sumaišo LASSO ir Ridge
+metodikas. LightGBM natūraliai ignoruoja NaN (trūkstamas) reikšmes, kai tuo tarpu
+tiesiniai modeliai naudoja 'zero' užpildymą.
+Saugu keisti: fill_strategy (ElasticNet'ui), num_leaves ir max_depth (LightGBM modeliams).
+Keisti atsargiai: learning_rate ir n_estimators yra tarpusavyje susiję. Didesnis
+n_estimators reikalauja mažesnio learning_rate.
+Naudojimo pavyzdys:
+model = LightGBMNowcast("BVP", n_estimators=300, min_child_samples=10)
+Svarbios pastabos: LightGBM yra labai greitas ir atsparus netransformuotam triukšmui.
+Dažnai lenkia klasikinius ekonometrinius metodus.
+
+File: nowcasting/models/pca_regression.py
+------------------------------------
+Paskirtis: Paprasta pagrindinių komponenčių (PCA) regresija.
+Vaidmuo pipeline: Naudojama pirmiausia kaip "bazinė" alternatyva arba kaip fundamentas
+ansambliams.
+Numatytieji parametrai:
+n_components: 5
+Ką reiškia šie numatytieji parametrai: Ištraukia 5 didžiausios dispersijos (variance)
+kryptis ir iš jų suformuoja naujus tarpusavyje nekoreliuojančius ortogonalius bruožus.
+Saugu keisti: n_components.
+Keisti atsargiai: Nėra rizikingų pakeitimų.
+Naudojimo pavyzdys:
+model = PCARegressionNowcast("BVP", n_components=10)
+
+
+File: nowcasting/models/tactis_wrapper.py
+------------------------------------
+Paskirtis: Giliojo mokymosi "Transformer" (TACTiS2) modelio apvalkalas,
+pritaikantis jį prie laiko eilučių prognozavimo.
+Vaidmuo pipeline: Tai "State-of-the-art" daugiakintamasis, "attention" mechanizmu
+paremtas modelis galingiausioms ir tiksliausioms prognozėms.
+Numatytieji parametrai:
+history_length: 24
+epochs: 20
+num_samples: 100
+skip_copula: False
+Ką reiškia šie numatytieji parametrai: Modelis žiūri į praeitį tik 24 žingsnius.
+Treniravimas vyksta tik 20 iteracijų/epochų. Prognozė ištraukiama skaičiuojant medianą
+iš 100 atskirai sugeneruotų Monte-Carlo Copula trajektorijų.
+Saugu keisti: skip_copula (nustačius į True, modelis nerealaus greičio testavimui).
+batch_size didinimas taip pat pagreitina prognozes esant didelei atminčiai.
+Keisti atsargiai: epochs skaičių. TACTiS modelis itin greitai permoksta (overfits)
+ant mažų makroekonominių duomenų. num_samples daro logaritminę įtaką atminties poreikiui.
+Naudojimo pavyzdys:
+model = TACTiSNowcastWrapper("BVP", epochs=5, num_samples=30, skip_copula=True)
+Svarbios pastabos: Wrapperyje yra speciali tik jam sukurta prognozavimo logika.
+Jam maitinamas apčiuopiamas ateities kontekstas, tuo pat metu užmaskuojant
+tą Y reikšmę, kurią modelis turi atspėti.
+
+File: nowcasting/models/vae.py
+------------------------------------
+Paskirtis: Variational Autoencoder (VAE), veikiantis kaip netiesinis dimensijų mažinimas
+prieš tolimesnes regresijas.
+Vaidmuo pipeline: Galingesnė alternatyva PCA. Suskaldo milžinišką bruožų
+masyvą į siaurą ir patogią erdvę.
+Numatytieji parametrai:
+latent_dim: 8
+hidden_dim: 64
+epochs: 30
+Ką reiškia šie numatytieji parametrai: Duomenys yra glaudinami "peršaunant" viską per 8
+mazgų lauką. Tai kartojama 30 iteracijų.
+Saugu keisti: latent_dim.
+Keisti atsargiai: Nėra itin rizikingų pakeitimų.
+Naudojimo pavyzdys:
+model = VAENowcast("BVP", latent_dim=10, epochs=50)
+Svarbios pastabos: Treniravimas vyksta dviejose fazėse. Pirma - generuojamas erdvės
+"suspaudimas" jį paliekant nevaldomą, po to jį "užšaldant", uždaroma procedūra
+regresija skirta testavimui ant užšaldytų latentinių mazgų.
+
+
+--------------------------------------------------------------------------------
+PART 3: EXPERIMENT RUNNERS (GRID, STAGED & EVALUATE)
+--------------------------------------------------------------------------------
+Projektas turi grupę vienodos architektūros runner skriptų, esančių `experiments/` kataloge:
+--run_tabular_search.py (ElasticNet, LightGBM)
+--run_midas_search.py (MIDAS)
+--run_bridge_search.py (Bridge Equations)
+--run_dfm_experiment.py (DFM)
+--run_bvar_experiment.py (BVAR, VAR)
+--run_tactis_experiment.py (TACTiS Transformer)
+
+Paskirtis: Sistemiškai testuoja hiperparametrų tinklelius arba vertina konkrečius modelius.
+Vaidmuo pipeline: Pagrindinis įrankis modelių kokybės matavimui istoriniuose duomenyse.
+
+Bendri bruožai ir varikliai (--engine):
+1. staged (Numatytasis): Atlieka 2 pakopų paiešką. Pirma pakopa testuoja viską ant 
+   trumpo lango (3 periodų), antra pakopa paima Top K modelius ir testuoja pilnu rėžimu.
+2. grid: Testuoja viską po vieną pilnu rėžimu (lėtas, bet išsamus).
+3. optuna: Naudoja „Bayesian Optimization“ (TPE sampler), kad automatiškai rastų 
+   optimalius parametrus erdvėje.
+4. evaluate: Reikalauja `--config-path`. Paima konkretaus modelio nustatymus (pvz. iš 
+   .json failo arba nukopijuotus iš CSV) ir atlieka vieną tikslų backtestą.
+
+Kiti svarbūs parametrai:
+--resume: Įjungia kontrolinių taškų (checkpoints) sistemą. Jei programa nulūžta 
+  skaičiavimų viduryje, paleidus dar kartą su šiuo flag'u, darbas bus tęsiamas 
+  nuo ten, kur sustota.
+--search-last-n-steps: Apriboja vertinimą tik iki paskutinių N laiko taškų (labai 
+  naudinga greitam testavimui). 0 reiškia pilną istoriją.
+--n-jobs: Lygiagrečių procesų skaičius. Dauguma modelių saugiai veikia su n-jobs=4 
+  arba daugiau, tačiau TACTiS geriau palikti 1.
+
+Visi runner’iai eksportuoja:
+- gridsearch_[model].csv — pilnas žurnalas su visų bandymų metrikomis ir hash'ais.
+- predictions_[model].csv — geriausios rastos konfigūracijos taškinės prognozės.
+- best_config_[model].json — laimėjusio modelio parametrų archyvas, tinkamas 
+  vėlesniam vertinimui per `--engine evaluate`.
+
+Svarbios pastabos: Checkpoint sistema naudoja MD5 hash'avimą, todėl net menkiausias 
+parametro pakeitimas (pvz. learning_rate nuo 0.1 iki 0.10001) privers sistemą 
+perskaičiuoti modelį iš naujo, nes tai bus laikoma nauja konfigūracija.
+--------------------------------------------------------------------------------
+PART 4: OPTUNA - BAYESIO OPTIMIZAVIMAS
+--------------------------------------------------------------------------------
+Kai tradicinis tinklelis (Grid Search) tampa per didelis arba per lėtas, projektas
+naudoja „Optuna“ biblioteką intelektualiam parametrų parinkimui.
+
+Kaip tai veikia:
+Modelių runner'iai naudoja TPE (Tree-structured Parzen Estimator) algoritmą. 
+Tai nėra tiesiog aklas bandymas — Optuna mokosi iš ankstesnių bandymų rezultatų 
+ir bando tas parametrų kombinacijas, kurios turi didžiausią tikimybę duoti 
+geresnį RMSE.
+
+Pagrindiniai parametrai:
+--engine optuna: Perjungia runner'į į Bayesian optimizavimo režimą.
+--n-trials: Kiek iš viso bandymų atlikti (pvz. 50 ar 100).
+--study-storage: Nuoroda į SQLite duomenų bazę (pvz. `sqlite:///optuna.db`), 
+  kurioje saugoma visa bandymų istorija. Tai leidžia saugiai tęsti tyrimą 
+  net po kompiuterio perkrovimo.
+--save-every-n-trials: Kas kiek bandymų išsaugoti progresą į tarpinį CSV failą.
+
+Svarbios pastabos:
+- Optuna automatiškai saugo „best_config.json“ su geriausiais rastais parametrais.
+- Naudojant `n_jobs > 1` su Optuna, ji naudoja SQLite užraktus (locking), kad 
+  keli procesai galėtų saugiai dalintis ta pačia bandymų istorija.
+- Jei modelio treniravimas „nulūžta“ dėl klaidos, Optuna tą bandymą pažymi kaip 
+  `FAIL` ir eina prie kito, nesustabdydama visos sistemos.
+
+--------------------------------------------------------------------------------
+PART 5: DATABASE & INGESTION (ETL)
+--------------------------------------------------------------------------------
+
+File: create_schema.py
+------------------------------------
+Paskirtis: Inicializuoja ir atstato PostgreSQL duomenų bazės schemą.
+Vaidmuo pipeline: Tai bazinis duomenų bazės sukūrimo etapas. Apibrėžia standartines
+lenteles (providers, datasets, series, releases, observations, ingestion_log).
+Saugu keisti: Nauji indeksai greitesnėms užklausoms.
+Keisti atsargiai: DDL keitimai gali ištrinti visas lenteles per CASCADE. Paleidus
+šį failą gali būti negrįžtamai panaikinti duomenys.
+Naudojimo pavyzdys:
+python create_schema.py
+Svarbios pastabos: Prisijungimui naudojamas DB_URL aplinkos kintamasis. Skirtas
+paleisti pirmą kartą arba per full_reload.py.
+
+------------------------------------
+File: check_health.py
+------------------------------------
+Paskirtis: Stebi duomenų šaltinių aktualumą, duomenų spragas ir galimą
+sugadinimą (pvz., flatlines).
+Vaidmuo pipeline: Veikia kaip duomenų bazės būklės dashboard'as.
+Parodo, jei atnaujinimai nepavyksta arba API grąžina tas pačias reikšmes.
+Numatytieji parametrai:
+DEFAULT_STALE_HOURS: 200
+Ką reiškia šis numatytasis parametras: Jei nuo paskutinio
+sėkmingo ingestion praėjo 200 valandų, šaltinis pažymimas kaip „STALE“.
+Saugu keisti: Slenksčių žodynus, pvz. yahoo_finance: 36 valandos.
+Keisti atsargiai: Nėra, nes tai tik read-only ataskaitinis įrankis.
+Naudojimo pavyzdys:
+python check_health.py
+Svarbios pastabos: Tikrina spragas > 95 dienų Monthly/Quarterly serijose
+ir pažymi serijas, kuriose >50 % nuoseklių reikšmių yra identiškos.
+
+-----------------------------------------------------
+File: full_reload.py / run_ingest.py / run_updates.py
+------------------------------------
+Paskirtis: Duomenų ingestinimo pipeline orkestratoriai.
+Vaidmuo pipeline: full_reload.py sunaikina DB ir atsisiunčia viską iš naujo.
+run_ingest.py naudoja multi-threading greitam atsisiuntimui.
+run_updates.py atlieka įprastą nuoseklų atnaujinimą.
+Numatytieji parametrai:
+--mode: 'initial' arba 'update' (run_ingest.py)
+Ką reiškia šie numatytieji parametrai: 'update' režimas naudoja API
+atsakymų hash’inimą, kad neprirašytų tų pačių duomenų pakartotinai.
+Saugu keisti: Loader’ių eiliškumą skriptuose.
+Keisti atsargiai: full_reload.py paleidimas ištrina visus duomenis PostgreSQL bazėje.
+Naudojimo pavyzdys:
+python run_ingest.py --mode update
+Svarbios pastabos: run_ingest.py naudoja ThreadPoolExecutor,
+kad FRED, Eurostat ir ALFRED būtų traukiami paraleliai.
+
+---------------------------------------------------------------------------------------
+Files: scripts/load_alfred.py, load_eurostat.py, load_fredmd.py, load_google_trends.py
+------------------------------------
+Paskirtis: Konkretūs API jungčių skriptai išoriniams duomenų tiekėjams.
+Vaidmuo pipeline: Paverčia API atsakymus į standartines
+observations ir series lentelių eilutes PostgreSQL bazėje.
+Numatytieji parametrai:
+max_workers: 2–4 (priklauso nuo skripto ir API ribų)
+max_vintages: 10 (ALFRED)
+Ką reiškia šie numatytieji parametrai: Eurostat leidžia didesnį paralelizavimą.
+ALFRED riboja, kiek istorinių vintage galima vienu metu traukti, todėl ribojama
+iki 10 paskutinių.
+Saugu keisti: max_workers Eurostat skripte (pvz., iki 8).
+Keisti atsargiai: Didinant max_workers Google Trends / PyTrends skriptuose galima
+gauti 429 Too Many Requests.
+Naudojimo pavyzdys:
+python scripts/load_alfred.py
+Svarbios pastabos: Loader’iai skaito, ką reikia parsisiųsti, iš /config/datasets.yaml.
+Šio YAML redagavimas yra standartinis būdas pridėti naujų serijų nekeičant kodo.
+
+------------------------------------
+File: scripts/db_helpers.py
+------------------------------------
+Paskirtis: Pagrindinis failas su duomenų bazės pagalbinėmis funkcijomis.
+Vaidmuo pipeline: Pateikia ensure_series, copy_observations_via_staging ir hash
+tikrinimus. Centralizuoja connection pooling.
+Numatytieji parametrai:
+pool_size=5, max_overflow=10
+Ką reiškia šie numatytieji parametrai: Leidžiama iki 15 lygiagrečių DB gijų.
+Saugu keisti: Pool dydžius.
+Keisti atsargiai: copy_observations_via_staging naudoja PostgreSQL COPY su StringIO
+buferiu. Keitimas gali sugadinti greitą masinį įrašymą.
+Naudojimo pavyzdys: Netaikoma.
+Svarbios pastabos: Įdiegta griežta content hashing logika; jei API grąžina tą patį
+CSV kaip vakar, DB gali praleisti atnaujinimą.
+
+--------------------------------------------------------------------------------
+PART 5: FEATURE ENGINEERING & UTILITIES
+--------------------------------------------------------------------------------
+
+File: nowcasting/features/engineering.py
+------------------------------------
+Paskirtis: Generuoja laiko eilučių lag ir rolling požymius.
+Vaidmuo pipeline: Paverčia žalius indeksus į prognozavimui tinkamus laginius požymius.
+Numatytieji parametrai:
+lags: [1, 3, 6]
+rolling_windows: [3, 6]
+Ką reiškia šie numatytieji parametrai: Sukuriami 1, 3 ir 6 periodų vėlavimai
+bei 3 ir 6 periodų slenkantys vidurkiai ir standartiniai nuokrypiai.
+Saugu keisti: Lagus galima plėsti iki 12.
+Keisti atsargiai: Labai dideli lagai sumažina galiojančių y stebėjimų skaičių.
+Naudojimo pavyzdys: Netaikoma, nes naudojama modelių pipeline viduje.
+
+-------------------------------------------------------
+File: nowcasting/features/selectors.py & selection.py
+------------------------------------
+Paskirtis: Įgyvendina su Sklearn suderinamus feature selection algoritmus.
+Vaidmuo pipeline: Labai svarbu dinamiškai mažinant dimensionality rolling
+backtester viduje, kad nebūtų look-ahead bias.
+Įgyvendinti selector’iai:
+--FastScreeningFilter: greitas filtravimas pagal koreliaciją ir pilnumą
+--VarianceFilter: pašalina beveik nekintančius požymius
+--CorrTopNSelector: mažinimas pagal Pearsono koreliaciją
+--LassoSelector ir ElasticNetSelector: penalizuotas požymių pasirinkimas
+--PCACompressor ir FactorAnalysisCompressor: tiesiniai embedding’ai
+--AutoencoderCompressor: netiesinis PyTorch pagrįstas embedding’as
+Numatytieji parametrai: Dažniausiai top_n=50 arba n_components=5. Autoencoder
+dažnai turi siaurą latent_dim=5.
+Saugu keisti: Autoencoder epoch skaičių arba PCACompressor komponentų skaičių.
+Keisti atsargiai: FastScreeningFilter lag mechanizmui reikia tiksliai suderintų
+indeksų.
+Naudojimo pavyzdys: Netaikoma, nes tiesiogiai kviečiama per scripts/run_*_search.py.
+
+
+--------------------------------------------------------------------------------
+PART 6: DASHBOARD & ROOT SCRIPTS
+--------------------------------------------------------------------------------
+
+File: dashboard.py
+------------------------------------
+Paskirtis: Streamlit pagrįsta grafinė vartotojo sąsaja.
+Vaidmuo pipeline: Leidžia vizualiai tyrinėti duomenų bazę, stebėti health būseną
+ir paleisti nowcast eksperimentus.
+Numatytieji parametrai:
+LIMIT: 5000 (dataset peržiūroms) / 200,000 (grafikų eilučių limitas)
+Ką reiškia šie numatytieji parametrai: Apsaugo naršyklę nuo perkrovos bandant
+parodyti per daug eilučių.
+Saugu keisti: UI išdėstymą ir cache trukmę (@st.cache_data(ttl=300)).
+Keisti atsargiai: Grid-search paleidimai iš UI vykdomi per subprocess.run(),
+todėl ilgi eksperimentai gali „užšaldyti“ Streamlit procesą.
+Naudojimo pavyzdys:
+streamlit run dashboard.py
+Svarbios pastabos: Turi „Predictions“ skiltį, kuri surenka predictions_*.csv ir
+gridsearch_*.csv failus visame projekte ir sudaro gyvą rezultatų suvestinę.
+
+-------------------------------------
+File: nowcasting/main.py
+------------------------------------
+Paskirtis: Pagrindinis API / įėjimo taškas vienkartiniam cross-model nowcast paleidimui.
+Vaidmuo pipeline: Sujungia duomenų įkėlimą, įvesties validaciją ir modelio vykdymą
+į vieną CLI komandą. Palaiko common_frequency ir mixed_frequency šakas.
+Numatytieji parametrai:
+--pca-components: 10
+--initial-train: 120
+Ką reiškia šie numatytieji parametrai: Sumažina dimensionality iki 10 tiesinių
+komponentų. Reikalauja bent 120 periodų iki pirmos out-of-sample prognozės.
+Saugu keisti: Feature argumentus, taip pat flag’us, išjungiančius kai kuriuos
+modelius (--no-dfm, --no-vae).
+Keisti atsargiai: _resolve_target_col fallback logiką, nes pakeitus galima netyčia
+pradėti prognozuoti ne tą makroekonominį rodiklį.
+Naudojimo pavyzdys:
+python -m nowcasting.main --mode common_frequency --target BVP_SA
+Svarbios pastabos: Sugeneruoja evaluation_summary.csv ir *_eval.csv failus kataloge
+/data/forecasts.
+
+--------------------------------------------------------------------------------
+PART 7: ADVANCED INGESTION (DISCOVERY & STATGOV)
+--------------------------------------------------------------------------------
+
+File: scripts/build_eurostat_list.py
+------------------------------------
+Paskirtis: Automatizuoja tinkamų makroekonominių dataset’ų atradimą iš Eurostat.
+Vaidmuo pipeline: Periodiškai skenuoja didelį Eurostat TOC naudodamas lygiagrečius
+worker’ius. Filtruoja dataset’us pagal geo (LT), dažnį (M/Q) ir tai, ar jie
+kerta tam tikrą vintage datą (pvz., 2004). Rezultatas išsaugomas į
+eurostat_autolist.yaml, kurį vėliau naudoja load_eurostat.py.
+Numatytieji parametrai:
+--workers-fast: 16
+--limit-found: 500
+Ką reiškia šie numatytieji parametrai: Naudojama 16 gijų, nes API lėtas, bet
+leidžia platų paralelizavimą. Paieška sustabdoma radus 500 tinkamų dataset’ų, kad
+duomenų bazė per daug neišsipūstų.
+Saugu keisti: limit-found, jei nori daugiau rodiklių.
+Keisti atsargiai: Hardcoded CUTOFF_DATE = date(2004, 1, 1). Jį pakeitus smarkiai
+keičiasi, kurie dataset’ai laikomi naudingi.
+Naudojimo pavyzdys:
+python scripts/build_eurostat_list.py --refresh-toc
+
+
+-------------------------------------------------
+Files: eurostat_discovery.py & eurostat_toc.py
+------------------------------------
+Paskirtis: Pagalbinės bibliotekos build_eurostat_list.py.
+Vaidmuo pipeline: eurostat_toc.py yra cache sluoksnis, saugantis nuo pakartotinio
+didelio XML TOC siuntimo. eurostat_discovery.py saugiai ir universaliai ištraukia
+dataset parametrus, kad nebūtų kritimų dėl versijų skirtumų.
+
+
+------------------------------------------------------------
+Files: load_statgov_all_flows.py & load_statgov_one_flow.py
+------------------------------------
+Paskirtis: Jungtys prie Lietuvos statistikos departamento.
+Vaidmuo pipeline: Apdoroja sudėtingas SDMX 2.1 XML/JSON struktūras, būdingas Lietuvos
+statistikos portalui. Dinamiškai išsprendžia codelist’us ir atpažįsta ketvirčio
+/ metų struktūras į pandas formatus.
+Numatytieji parametrai:
+--workers: 2 (all_flows)
+Ką reiškia šis numatytasis parametras: OSP portalas yra gerokai jautresnis rate
+limiting nei Eurostat.
+Saugu keisti: Pradžios ir pabaigos datos ribas.
+Keisti atsargiai: Regex taisykles, kurios atpažįsta K1, P1, Mėnuo tekstus
+infer_frequency_from_dataset. Jos trapios ir stipriai priklauso nuo OSP etikečių.
+
+------------------------------------
+File: load_new_source.py
+------------------------------------
+Paskirtis: Bendras REST/CSV naujo šaltinio pridėjimo vedlys.
+Vaidmuo pipeline: Leidžia pridėti visiškai naujus duomenų šaltinius per
+interaktyvią terminalo sąsają be papildomo Python kodo rašymo. Palaiko JSON
+path dot-notation ir Bearer Token autentifikaciją.
+Numatytieji parametrai: Pagination defaults (size=1000).
+Naudojimo pavyzdys:
+python scripts/load_new_source.py
+(paleidžia interaktyvią sąsają)
+
+--------------------------------------------------------------------------------
+PART 8: UTILITIES & QUALITY CHECKS
+--------------------------------------------------------------------------------
+
+File: scripts/get_vintage.py
+------------------------------------
+Paskirtis: Ištraukia dataset būseną tokią, kokia ji buvo žinoma konkrečią istorinę datą.
+Vaidmuo pipeline: Leidžia testuoti „Real-Time Data“ idėją, panašią į ALFRED logiką.
+Naudojimo pavyzdys:
+python scripts/get_vintage.py --date 2019-12-31
+
+------------------------------------------------
+File: scripts/check_last_data.py & check_gdp.py
+------------------------------------
+Paskirtis: Greiti analitiniai skriptai.
+Vaidmuo pipeline: Užklausia DB observations lentelę ir padeda pažymėti labiausiai
+pasenusias serijas, kurių atnaujinimai galėjo tyliai nustoti veikti.
+Naudojimo pavyzdys:
+python scripts/check_last_data.py
+
+----------------------------------------
+File: scripts/clear_data.py
+------------------------------------
+Paskirtis: Kraštutinis pilno išvalymo įrankis.
+Vaidmuo pipeline: Išvalo viską PostgreSQL duomenų bazėje, naudodamas CASCADE logiką.
+Naudojimo pavyzdys:
+python scripts/clear_data.py --force
+
+
+--------------------------------------------------------------------------------
+PART 9: DUOMENŲ SAUGOJIMO MECHANIKA IR MIGRACINĖS SISTEMOS
+--------------------------------------------------------------------------------
+
+1. Failų išsaugojimo ekosistema (Caching strategija):
+- Žali API duomenys (Raw Storage): Žali API atsakymai iš karto išsaugomi į
+ `data/raw/` kartu su failo SHA256 kodu (hash). Ingestinimo
+  sistema (`run_updates.py`) kiekvieną kartą sutikrina, ar naujai atsisiųstas failas
+   tokio paties atspaudo kaip praėjusį kartą. Jei taip, tai lėta duomenų bazės
+   papildymo transakcija visiškai ignoruojama/praleidžiama, taip sutaupant resursų.
+- Vektorinis/Panelinis duomenų saugojimas (Vector Storage): Sukompiliuoti duomenys
+greitam modelių treniravimui skaitomi iš `data/processed/` Parquet formatu, kuris
+yra 10-100 kartų greitesnis nei standartinis CSV.
+- Modelių ir Prognozių saugojimas (Model Forecasts): `data/forecasts/` kataloge
+išsaugomi modelių failai, kuriuos vartotojo sąsaja (`dashboard.py`) tiesiogiai
+sinchronizuoja ir realiu laiku atvaizduoja ekrane (be būtinybės dar kartą daryti lėtų
+kreipinių į modelį).
+
+2. Duomenų bazės schemos keitimo modelis (Alembic Migrations):
+PostgreSQL lentelės nėra kietai įkaltos (angl. hardcoded). Jas seka išorinė „Alembic“
+biblioteka, kuri užtikrina, kad pridėjus naują stulpelį į SQL, nereiktų visko trinti
+ iš naujo.
+KAIP ATNAUJINTI DUOMENŲ BAZĘ PRIDĖJUS STULPELĮ KODE:
+`alembic revision --autogenerate -m "Added new column"`
+`alembic upgrade head`
+Ši migracijų sistema efektyviai eliminuoja poreikį valyti esamus istorinius duomenis
+ (`clear_data.py`) norint pakoreguoti schemos struktūrą.
+
+
+--------------------------------------------------------------------------------
+PART 10: MISCELLANEOUS ROOT SCRIPTS & LOGS
+--------------------------------------------------------------------------------
+
+File: check_db.py
+------------------------------------
+Paskirtis: Greitas diagnostinis skriptas.
+Vaidmuo pipeline: Užklausia duomenų bazę ir suskaičiuoja eilučių skaičių
+(pvz., fredmd duomenų tiekėjo), kad būtų galima patikrinti, ar duomenys sėkmingai
+įrašyti.
+
+File: test_connection.py
+------------------------------------
+Paskirtis: Paprastas ryšio su PostgreSQL testas.
+Vaidmuo pipeline: Prisijungia prie nowcast_db naudojant SQLAlchemy ir išveda duomenų
+bazės versiją. Naudingas konfigūruojant aplinką.
+
+File: error_log.txt
+------------------------------------
+Paskirtis: Vykdymo klaidų žurnalas.
+Vaidmuo pipeline: Saugo aplinkos arba failų apdorojimo klaidas (tracebacks).
+
+File: tmp_check_toc.py
+------------------------------------
+Paskirtis: Laikinas testavimo skriptas.
+Vaidmuo pipeline: Eksperimentaliai testuoja parduotų API galimybes
+(pvz. filtruoti Eurostat SDMX duomenis pagal 'LT' iki 2004 metų).
+
+--------------------------------------------------------------------------------
+PART 11: ADDITIONAL SCRIPTS & CONFIGS
+--------------------------------------------------------------------------------
+
+File: scripts/__init__.py
+------------------------------------
+Paskirtis: Python paketo inicializacijos failas.
+Vaidmuo pipeline: Leidžia Python interpretatoriui atpažinti `scripts` katalogą
+kaip modulį. Paprastai tuščias.
+
+File: scripts/load_financials.py
+------------------------------------
+Paskirtis: Finansinių rinkų duomenų atsisiuntimas.
+Vaidmuo pipeline: Naudojant `yfinance` biblioteką traukia akcijų, valiutų ar
+indeksų istorines kainas (pagal yaml konfigūraciją) ir įkelia jas į duomenų bazę.
+Palaiko inkrementinį ("update") atsisiuntimą.
+
+File: scripts/config/eurostat_autolist.yaml
+------------------------------------
+Paskirtis: Dinaminis Eurostat duomenų rinkinių sąrašas.
+Vaidmuo pipeline: Šį failą automatiškai sugeneruoja `build_eurostat_list.py`.
+Jame saugomi potencialiai tinkami (turintys LT retrospektyvą) rodikliai, kuriuos
+masiniam siuntimui po to nuskaito `load_eurostat.py`.
+
+--------------------------------------------------------------------------------
+PART 12: ENVIRONMENT, CONFIGURATION & PROJECT FILES
+--------------------------------------------------------------------------------
+
+File: .env
+------------------------------------
+Paskirtis: Aplinkos kintamųjų konfigūracija.
+Vaidmuo pipeline: Saugo jautrius duomenis (pvz., DB_URL duomenų bazei, API raktus).
+Šis failas nėra traukiamas į Git istoriją.
+
+Files: .idea/ (katalogas)
+------------------------------------
+Paskirtis: IDE (PyCharm / IntelliJ) projekto nustatymai.
+Vaidmuo pipeline: Sudaro vidinę IDE struktūrą (moduliai, versijavimo nustatymai,
+inspekcijų profiliai). Pačiam modelių ar skriptų vykdymui jokios įtakos neturi.
+
+File: alembic.ini
+------------------------------------
+Paskirtis: Alembic migracijų įrankio nustatymai.
+Vaidmuo pipeline: Apibrėžia kelią iki migracijų aplanko (`alembic/env.py`) ir ryšio
+su duomenų baze konfigūraciją išoriniam schemos valdymui.
+
+File: config/datasets.yaml
+------------------------------------
+Paskirtis: Centralizuotas duomenų siuntimo registras.
+Vaidmuo pipeline: Apibrėžia, kokius makroekonominius rodiklius traukti iš Eurostat,
+FRED ir kitų šaltinių. Keičiant šį failą galima labai lengvai pridėti naujus rodiklius
+be kodo keitimo.
+
+Files: config/sources/*.json
+------------------------------------
+Paskirtis: Custom šaltinių apibrėžimai (pvz., example_csv.json, world_bank.json).
+Vaidmuo pipeline: Naudojami kartu su `load_new_source.py` skriptu kaip šablonai
+prijungiant naujus, neeilinius API ar CSV failus per JSON dot-notation konfigūraciją.
+
+File: docker-compose.yml
+------------------------------------
+Paskirtis: Docker konteinerių orkestravimas.
+Vaidmuo pipeline: Leidžia vienos komandos pagalba (`docker-compose up -d`) greitai
+pakelti lokalų PostgreSQL duomenų bazės serverį testavimui ar darbui.
+
+File: requirements.txt
+------------------------------------
+Paskirtis: Python bibliotekų priklausomybės.
+Vaidmuo pipeline: Nurodo visas išorines bibliotekas (pvz. pandas, yfinance, sqlalchemy),
+kurios reikalingos šiam projektui. Skirtas garantuoti nuoseklumą tarp skirtingų aplinkų
+(`pip install -r requirements.txt`).
+
+--------------------------------------------------------------------------------
+PART 13: DIRECTORY STRUCTURES & ADDITIONAL MODULES
+--------------------------------------------------------------------------------
+
+Files: nowcasting/**/__init__.py
+------------------------------------
+Paskirtis: Python paketų inicializacija.
+Vaidmuo pipeline: `nowcasting/__init__.py`, `evaluation/__init__.py`, `features/__init__.py` ir `models/__init__.py`
+paverčia šiuos aplankus importuojamais moduliais. Dažniausiai būna tušti.
+
+File: nowcasting/utils/reproducibility.py
+------------------------------------
+Paskirtis: Sėklų (seeds) ir atsitiktinumo valdymas.
+Vaidmuo pipeline: Užtikrina atkuriamumą užfiksuojant NumPy, PyTorch ir Python
+pseudo-atsitiktinių skaičių generatorius. Naudojamas visuose ML / DL modelių
+apmokymuose ir iteracijose, siekiant pašalinti atsitiktines variacijas tarp tų
+pačių hiperparametrų paleidimų.
+
+Directory: data/raw/ (ir scripts/data/raw/)
+------------------------------------
+Paskirtis: Atsisiųstų pirminių duomenų kaupykla.
+Vaidmuo pipeline: Čia originaliu formatu (dažniausiai CSV arba JSON failais,
+pvz. `worldbank_ltu_gdp_...json`) išsaugomi atsakymai iš išorinių API
+(Eurostat, FRED ir t.t.). Tai yra pirminis šaltas saugojimas prieš perkeliant viską
+pradine forma į PostgreSQL.
+
+Directory: data/processed/
+------------------------------------
+Paskirtis: Transformuotų ir paruoštų analizei duomenų bazė.
+Vaidmuo pipeline: Saugomi galutiniai, agreguoti ir pagal dažnį sulygiuoti panelinių
+duomenų failai (dažniausiai `.parquet` arba `.csv`). Šiuos failus pasigamina
+`data_preparation.py` skriptas ir juos vėliau modelyje valgo backtesteris.
+
+Directory: data/forecasts/ (ir scripts/data/forecasts/)
+------------------------------------
+Paskirtis: Modelių prognozių ir metrikų išvestis.
+Vaidmuo pipeline: Į šį aplanką nukreipiami eksperimentų (pvz., `run_bvar_experiment.py`)
+rezultatai. Čia saugomi atrinktų geriausių architektūrų konfigūracijų failai
+(`best_config_*.json`), testavimo laikų žurnalai ir pačių testavimų metrikos
+(`*_eval.csv`). Šiuos failus surenka `dashboard.py` vizualizacijai naršyklėje.
+
+Directory: tactis_repo/
+------------------------------------
+Paskirtis: TACTiS 2 modelio bibliotekos talpykla.
+Vaidmuo pipeline: Tai yra TACTiS 2 neuroninis tinklas. Šiame aplankale tiesiog saugomi
+failai, susiję vien tik su šia giliojo mokymosi struktūra. Jų funkcionalumas atsiskiria
+nuo pagrindinio pipeline, todėl šių atskirų failų detaliai aprašinėti nereikia.
+
+
+
