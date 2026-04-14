@@ -1,14 +1,18 @@
 """
-backtester.py — Rolling / Expanding Backtest Evaluator
-======================================================
-Evaluates nowcast models over a rolling or expanding time window while strictly
-preventing data leakage (transformers and models are only fit on the training
-window).
+Šis modulis skirtas nowcasting modelių vertinimui naudojant rolling arba expanding
+backtesting strategijas,užtikrinant, kad nebūtų duomenų nutekėjimo
+(data leakage). Visi modeliai yra treniruojami tik naudojant treniravimo lango
+duomenis.
 
-Supports:
-- common_frequency: X and y share the same cadence/index grid
-- mixed_frequency: intended for bridge-style models where X is high-frequency
-  and y is low-frequency; iteration is done over observed target dates
+Pagrindinės funkcijos:
+Backtesting su expanding arba rolling langais
+Du režimai:
+common_frequency  – kai X ir y turi tą pačią laiko struktūrą
+mixed_frequency   – kai X yra aukšto dažnio, o y – žemo dažnio
+
+Automatinis X ir y indeksų suderinimas
+Transformer ir feature selection pipeline palaikymas
+Modelio prognozių standartizavimas į vieningą formatą
 """
 
 from __future__ import annotations
@@ -26,7 +30,6 @@ logger = logging.getLogger("nowcast_backtest")
 class RollingBacktester:
     """
     Backtester for nowcasting models.
-
     Parameters
     ----------
     initial_train_periods : int
@@ -351,7 +354,7 @@ class RollingBacktester:
 
             # For mixed-frequency bridge workflows, supervised external selectors
             # often do not apply cleanly because HF X and LF y differ in length.
-            # We therefore try y-aware fit only when lengths match; otherwise we
+            #Therefore try y-aware fit only when lengths match; otherwise we
             # fall back to unsupervised fit(X). If that fails, the step is skipped.
             if transformer is not None:
                 X_train, X_test, n_trans_features = self._apply_step(

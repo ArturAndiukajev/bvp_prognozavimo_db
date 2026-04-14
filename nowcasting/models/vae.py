@@ -1,7 +1,4 @@
 """
-vae.py — Variational Autoencoder Nowcast Model
-================================================
-
 Architecture
 ------------
 1. VAE Encoder: compress the high-dimensional panel (PCA-reduced) into a
@@ -10,15 +7,6 @@ Architecture
 3. VAE Decoder: reconstruct input from z (trained jointly via ELBO loss).
 4. Regression head: after training the VAE, freeze the encoder and fit a
    linear ElasticNetCV regression from the latent mean mu to the GDP target.
-
-At inference: encode X_test → mu → ElasticNetCV → GDP prediction.
-
-Why VAE for nowcasting?
------------------------
-- Learns a smooth, disentangled latent representation of the macroeconomic panel.
-- Robust to noise and missing values (filled before encoding).
-- The latent space acts as a learned nonlinear dimensionality reduction,
-  complementing PCA (linear) used by other models.
 """
 
 from __future__ import annotations

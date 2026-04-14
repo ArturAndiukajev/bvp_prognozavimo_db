@@ -1,3 +1,4 @@
+"""Pagalbinis failas, susijęs su loaderiais."""
 import os
 import json
 import logging
@@ -18,13 +19,11 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("db_helpers")
 
-
 # ---------------------------------------------------------------------------
 # Engine / config
 # ---------------------------------------------------------------------------
 
 _DEFAULT_DB_URL = "postgresql+psycopg2://nowcast:nowcast@localhost:5432/nowcast_db"
-
 
 def get_db_url() -> str:
     return os.environ.get("DB_URL", _DEFAULT_DB_URL)
@@ -56,7 +55,6 @@ def load_config_first_existing(paths: Sequence[Path]) -> dict:
 # Utilities
 # ---------------------------------------------------------------------------
 
-
 class Timer:
     def __init__(self, label: str):
         self.label = label
@@ -86,10 +84,8 @@ def sha256_file(path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# DB primitives
+# DB
 # ---------------------------------------------------------------------------
-
-
 def ensure_provider(conn, name: str, base_url: str | None = None) -> int:
     conn.execute(
         text(
@@ -271,12 +267,9 @@ def log_ingestion(
         },
     )
 
-
 # ---------------------------------------------------------------------------
-# Bulk COPY helpers (observations)
+# Bulk COPY helpers
 # ---------------------------------------------------------------------------
-
-
 def _get_psycopg2_connection(sa_conn):
     raw = getattr(sa_conn, "connection", None)
     if raw is None:
@@ -327,17 +320,10 @@ def copy_observations_via_staging(conn, rows: Iterable[Tuple[int, str, str, floa
         )
     )
 
-
-# ---------------------------------------------------------------------------
-# Misc
-# ---------------------------------------------------------------------------
-
-
 def analyze_table(engine, table_name: str):
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         logger.info(f"Running ANALYZE on {table_name}...")
         conn.execute(text(f"ANALYZE {table_name}"))
-
 
 def last_period_date(conn, series_id: int):
     return conn.execute(

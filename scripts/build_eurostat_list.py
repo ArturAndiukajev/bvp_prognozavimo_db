@@ -1,3 +1,13 @@
+"""
+Šitas failas skirtas automatiniam tinkamų Eurostat duomenų rinkinių atrinkimui
+ir jų sąrašo sudarymui. Jis atsisiunčia arba naudoja užkešuotą Eurostat TOC katalogą,
+atlieka greitą duomenų rinkinių tinkamumo patikrą pagal geografinį filtrą ir dažnį,
+papildomai nustato ankstyviausią prieinamą datą Lietuvai, ir sugeneruoja
+YAML failą su automatiškai atrinktais duomenų rinkiniais.
+Taip pat palaikomas tarpinių rezultatų kešavimas, paralelinis apdorojimas
+ir filtravimas pagal raktažodžius.
+"""
+
 import argparse
 import json
 import time
@@ -29,7 +39,7 @@ AUTOLIST_YAML.parent.mkdir(parents=True, exist_ok=True)
 # --------------------
 GEO = "LT"
 FREQS_NEEDED = {"M", "Q"}
-CUTOFF_DATE = date(2004, 1, 1)  #dataset must have min_date <= 2004-01-01 for LT
+CUTOFF_DATE = date(2004, 1, 1)
 LIMIT_FOUND_DEFAULT = 500
 
 # --------------------

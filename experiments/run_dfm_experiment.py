@@ -1,18 +1,39 @@
 """
-run_dfm_experiment.py - DFM Grid Search & Feature Selection Experiment Pipeline
-=============================================================================
+DFM eksperimento paleidimo failas su Grid Search, Optuna ir feature selection.
 
-Executes a grid search over DFM hyperparameters and feature selection
-strategies. Parallelizes outer loops to speed up backtesting. Resulting
-combinations are sorted by RMSE/MAE and exported to CSV.
+Šis skriptas leidžia vykdyti eksperimentus su Dynamic Factor Model (DFM),
+testuojant skirtingas hiperparametrų kombinacijas ir kintamųjų atrankos metodus.
 
-Example:
-    python scripts/run_dfm_experiment.py --selectors none,pca,lasso,elasticnet \
-           --dfm-k-factors 1,2,3 \
-           --pca-components 3,5 \
-           --lasso-alphas 0.05,0.1 \
-           --n-jobs 4 --search-mode quick
+Pagrindinės funkcijos:
+Grid Search per DFM hiperparametrus ir feature selection metodus
+Optuna optimizacija
+Staged (dviejų etapų) paieška greitesniam filtravimui
+Backtesting (rolling / expanding window)
+Parallelizavimas (joblib) spartesniam vykdymui
+Automatinis rezultatų išsaugojimas (CSV / JSON)
+Galimybė atnaujinti (resume) nutrauktus eksperimentus
+
+Palaikomi režimai:
+grid      – pilnas kombinacijų perrinkimas
+staged    – greitas dviejų etapų filtravimas
+optuna    – pažangi hiperparametrų optimizacija
+evaluate  – vienos konfigūracijos įvertinimas
+
+Rezultatai:
+Modelių palyginimas pagal RMSE / MAE
+Geriausių konfigūracijų išsaugojimas
+Prognozių eksportas į CSV
+
+Pavyzdys:
+python scripts/run_dfm_experiment.py
+--selectors none,pca,lasso,elasticnet
+--dfm-k-factors 1,2,3
+--pca-components 3,5
+--lasso-alphas 0.05,0.1
+--n-jobs 4
+--search-mode quick
 """
+
 
 import argparse
 import itertools
@@ -21,8 +42,7 @@ import logging
 import os
 import time
 import random
-from typing import Dict, Any, List, Optional
-from joblib import Parallel, delayed
+from typing import Dict, Any, List
 
 import pandas as pd
 import numpy as np
@@ -38,7 +58,6 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# We import pipeline bits from nowcasting package
 from nowcasting.main import build_arg_parser as build_main_parser
 from nowcasting.evaluation.checkpoint import prune_grid, run_chunks, build_run_signature
 from nowcasting.utils.data_loader import load_cf_panel, load_mf_panels, _DEFAULT_DATA_DIR
@@ -83,15 +102,13 @@ def build_experiment_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ae-latent-dims", type=str, default="3,5")
     ap.add_argument("--fast-screen-top-k", type=str, default="50,100,250,500")
 
-    # Time rules
     ap.add_argument("--train-windows", type=str, default="120", 
                     help="Initial train window sizes (e.g., 80,120)")
     ap.add_argument("--step-sizes", type=str, default="1", 
                     help="Backtest step sizes (e.g., 1,3)")
     ap.add_argument("--window-type", type=str, default="expanding,rolling", help="expanding or rolling or both")
     ap.add_argument("--rolling-window-size", type=str, default="120", help="Rolling window size, relevant only if window-type includes rolling")
-    
-    # Experiment controls
+
     ap.add_argument("--search-mode", type=str, choices=["quick", "full"], default="full",
                     help="Quick mode reduces maxiter and uses fewer backtest steps.")
     ap.add_argument("--search-last-n-steps", type=int, default=0,
@@ -168,8 +185,7 @@ def run_single_experiment(
             # Shift the initial_train so it only runs the last N steps.
             required_start_index = len(y_target) - search_last_n_steps
             init_train = max(init_train, required_start_index)
-            
-        # [NEW]: Use fallback to eval_mode="mixed_frequency" and pass rolling window parameter
+
         bt = RollingBacktester(
             initial_train_periods=init_train, 
             step_size=step_sz,
@@ -178,7 +194,6 @@ def run_single_experiment(
             rolling_window_size=config.get("rolling_window_size")
         )
 
-        
         # 2. Selector Initialization
         # VarianceFilter is always implicitly added in front to drop constants safely
         from sklearn.pipeline import make_pipeline
@@ -190,9 +205,8 @@ def run_single_experiment(
         fo = config["dfm_factor_order"]
         mod_kws = {}
         if search_mode == "quick":
-            mod_kws["maxiter"] = 50  # Faster, lower tolerance DFM fits
-            
-        # [NEW/BUGFIX]: Pass mixed_frequency down to DFM to support MQ. Include quarterly cols metadata.
+            mod_kws["maxiter"] = 50
+
         model = DynamicFactorNowcast(
             target_col=str(y_target.name), 
             k_factors=k, 
@@ -211,7 +225,7 @@ def run_single_experiment(
                 model=model,
                 X_panel=X_panel,
                 y_target=y_target,
-                transformer=None,  # Not used, but could add feature engineering here
+                transformer=None,
                 feature_selector=selector
             )
             
@@ -222,10 +236,7 @@ def run_single_experiment(
             res["status"] = "failed"
             res["error_message"] = "Backtester returned empty DataFrame"
             return res
-            
-        # Extract metadata counts from final pipeline state if available
-        # Actually, extracting feature counts from backtester is hard since pipeline is fit internally per step. 
-        # But we can approximate using final model features
+
         metrics = compute_metrics(eval_df, model_name=f"DFM_{k}f")
         res["rmse"] = metrics["RMSE"].iloc[0]
         res["mae"] = metrics["MAE"].iloc[0]
@@ -286,8 +297,8 @@ def optuna_objective(
     elif selector_name == "autoencoder":
         selector_params["latent_dim"] = trial.suggest_int("ae_dim", 2, 20)
 
-    dfm_k_factors = trial.suggest_int("dfm_k_factors", 1, 10)
-    dfm_factor_order = trial.suggest_int("dfm_factor_order", 1, 5)
+    dfm_k_factors = trial.suggest_int("dfm_k_factors", 1, 4)
+    dfm_factor_order = trial.suggest_int("dfm_factor_order", 1, 3)
 
     train_window = trial.suggest_categorical("train_window", [60, 80, 100, 120])
     step_size = trial.suggest_categorical("step_size", [1, 3])
@@ -417,22 +428,19 @@ def run_evaluation_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argp
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    # Robust parsing of nested JSON strings (e.g. from results CSV exports)
     def _parse_if_str(val):
         if isinstance(val, str):
             try: return json.loads(val)
             except: return val
         return val
 
-    # Extract configuration parts
     eval_config = {}
     for k, v in config.items():
         if k not in ["rmse", "mae", "status", "runtime_sec", "n_eval_points", "n_folds", "error_message", "n_raw_features", "n_trans_features", "n_sel_features", "n_model_used_vars"]:
             eval_config[k] = _parse_if_str(v)
 
     logger.info(f"Evaluating DFM with config from {args.config_path}")
-    
-    # Wrap in single-item grid for checkpoint system
+
     search_grid = [eval_config]
     
     run_signature = build_run_signature(
@@ -492,7 +500,7 @@ def generate_experiment_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
     
     grids = []
     
-    # We iterate selectors, then build their param variations
+    #Iterate selectors, then build their param variations
     for sel in selectors_to_run:
         param_variations = [{}]
         
@@ -516,7 +524,6 @@ def generate_experiment_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
             param_variations = [{"top_k": n} for n in parse_list(args.fast_screen_top_k, int)]
             
         for p_var in param_variations:
-            # Cartesian with DFM params
             for (k, fo, tw, sz, wt) in itertools.product(k_factors, factor_orders, train_windows, step_sizes, window_types):
                 cfg = {
                     "selector_method": sel,
@@ -540,8 +547,7 @@ def generate_experiment_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
                         grids.append(r_cfg)
                 else:
                     grids.append(cfg)
-                
-    # [BUGFIX]: Seed RNG instead of random.shuffle for reproducible pipelines
+
     if args.search_max_configs > 0 and len(grids) > args.search_max_configs:
         rng = random.Random(getattr(args, "seed", 123))
         rng.shuffle(grids)
@@ -559,7 +565,6 @@ def main():
     
     # 1. Load Data
     data_dir = Path(args.data_dir)
-    # [NEW]: Mixed Frequency load support. Auto-combines M and Q panels for the model.
     if args.mixed_frequency:
         logger.info(f"Loading MF panel ...")
         X_m, X_q, y_target = load_mf_panels(data_dir, args.target, panel_arg=args.input_panel)
@@ -606,8 +611,6 @@ def main():
         run_evaluation_engine(X_panel, y_target, args, out_path.parent, suffix_base)
         return
 
-    # Fallback to standard grid/staged below...
-    
     if active_engine == "staged":
         s1_sels = [s.strip() for s in args.selectors_fast_only.split(",")]
         grid_s1 = [cfg for cfg in grid if cfg["selector_method"] in s1_sels]

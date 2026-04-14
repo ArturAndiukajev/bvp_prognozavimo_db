@@ -1,7 +1,8 @@
 """
-check_health.py — Database health and freshness monitoring script.
-Outputs per-source freshness, row counts, stale-detection, and
-flags any source that hasn't been updated recently.
+Tai yra duomenų bazės būklės ir duomenų aktualumo stebėjimo skriptas.
+Pateikia kiekvieno šaltinio duomenų atnaujinimo būseną, įrašų skaičių,
+aptinka pasenusius duomenis ir pažymi šaltinius, kurie nebuvo atnaujinti
+ilgesnį laiką.
 """
 import os
 import logging

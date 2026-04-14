@@ -1,9 +1,15 @@
-﻿import logging
+﻿"""
+Šitas failas skirtas google trends duomenims atsiųsti.
+Surenkami paieškos duomenis pagal raktinius žodžius ir šalis,
+transformuoja savaitinius duomenis į mėnesinį formatą, išsaugo neapdorotus duomenis,
+tikrina pokyčius pagal hash reikšmę ir registruoja įkėlimo rezultatus.
+Yra parallelizavimas.
+"""
+import logging
 import time
 from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Iterable
 
 import pandas as pd
 from pytrends.request import TrendReq
@@ -26,17 +32,13 @@ from scripts.db_helpers import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("google_trends")
 
-
-engine = get_engine(pool_size=3, max_overflow=3)
-
+engine = get_engine(pool_size=5, max_overflow=5)
 
 RAW_DIR = Path("data/raw/google_trends")
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "datasets.yaml"
 FALLBACK_CONFIG = Path(__file__).with_name("datasets.yaml")
-
 
 def _load_config() -> dict:
     return load_config_first_existing([CONFIG_PATH, FALLBACK_CONFIG])
@@ -59,6 +61,7 @@ GEO_NAMES: dict[str, str] = {
 
 
 def monthly_from_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    """Funkcija transformuoja savaitinius duomenis į mėnesinį formatą"""
     df = df.copy()
     df.index = pd.to_datetime(df.index)
     monthly = df.resample("MS").mean()
@@ -68,11 +71,13 @@ def monthly_from_weekly(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def chunk_keywords(lst, size=5):
+    """Padalina sąraša į dalis, kad išvengtumėme google trends klaidų."""
     for i in range(0, len(lst), size):
         yield lst[i : i + size]
 
 
 def prepare_rows_for_copy(series_id: int, df_monthly: pd.DataFrame, vintage_at: datetime, release_id: int) -> list:
+    """Funkcija paima datas ir reikšmes, praleidžia Nan, formuoja kortežus."""
     oat_iso = vintage_at.isoformat()
     rows: list[tuple[int, str, str, float, int]] = []
     for dt, row in df_monthly.iterrows():
@@ -85,6 +90,9 @@ def prepare_rows_for_copy(series_id: int, df_monthly: pd.DataFrame, vintage_at: 
 
 def ingest_batch(batch: list[str], geo: str, geo_name: str, timeframe: str, mode: str,
                  downloaded_at: datetime, vintage_at: datetime, stamp: str, dataset_id: int):
+    """Funkcija užklauso duomenis, pašalina isPartial stulpelį, išsaugo csv,
+    skaito hash reikšmę, jei mode=update, tikrina ar buvo tokie duomenys; sukuria
+    relizą."""
     logger.info(f"Ingesting batch: {batch}")
     pytrends = TrendReq(hl="en-US", tz=360)
 

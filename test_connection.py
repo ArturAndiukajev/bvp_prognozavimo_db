@@ -1,3 +1,6 @@
+"""
+Šitas failas skirtas patikrinti prisijungimą prie duombazės.
+"""
 from sqlalchemy import create_engine, text
 
 DB_URL = "postgresql+psycopg2://nowcast:nowcast@localhost:5432/nowcast_db"

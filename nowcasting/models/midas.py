@@ -1,7 +1,4 @@
 """
-midas.py — U-MIDAS (Unrestricted MIDAS) Nowcast Model
-=======================================================
-
 Mixed-Data Sampling regression where high-frequency predictors are stacked
 into a flat feature vector and regressed on a low-frequency target.
 

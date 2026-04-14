@@ -1,3 +1,9 @@
+"""
+Šitas failas skirtas statistikos departamento vienam datasetui atsiųsti.
+Jis apdoroja skirtingus laiko formatus,
+formuoja laiko eilučių serijas, užtikrina duomenų versijavimą ir
+registruoja įkėlimo rezultatus.
+"""
 import argparse
 import hashlib
 import json

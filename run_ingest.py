@@ -1,12 +1,16 @@
+"""
+Šitas failas skirtas šaltinių duomenims atsiųsti vienu metu arba jų atnaujinimui.
+Paleidžia loaderius.
+"""
+
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
-from scripts import load_fredmd, load_alfred, load_eurostat, load_google_trends, load_financials, build_eurostat_list
+from scripts import load_fredmd, load_alfred, load_eurostat, load_google_trends, load_financials, build_eurostat_list, load_statgov_all_flows
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("IngestionRunner")
-
 
 def _run_loader(name: str, fn):
     """Wrapper that captures exceptions and logs them without stopping other loaders."""
@@ -16,7 +20,6 @@ def _run_loader(name: str, fn):
         logger.info(f"--- Finished {name} ---")
     except Exception as e:
         logger.error(f"{name} failed: {e}", exc_info=True)
-
 
 def _run_eurostat_dispatch(eurostat_mode: str, ingest_mode: str):
     """Dispatches the Eurostat phase to the correct loader based on CLI arg."""
@@ -50,8 +53,9 @@ def main(mode: str = "initial", eurostat_mode: str = "load"):
     wave2 = {
         "Eurostat":       lambda: _run_eurostat_dispatch(eurostat_mode, mode),
         "Google Trends":  lambda: load_google_trends.main(mode=mode),
+        "StatGov OSP":    lambda: load_statgov_all_flows.main(mode=mode, workers=2),
     }
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=3) as ex:
         futs = {ex.submit(_run_loader, name, fn): name for name, fn in wave2.items()}
         for fut in as_completed(futs):
             fut.result()

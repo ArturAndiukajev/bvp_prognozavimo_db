@@ -1,6 +1,4 @@
 """
-nowcasting/main.py
-==================
 Nowcasting framework entry-point.
 
 Two modes
@@ -49,10 +47,6 @@ from nowcasting.evaluation.metrics import compute_metrics
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("nowcast_main")
-
-
-
-
 
 # ---------------------------------------------------------------------------
 # Common-Frequency Pipeline
@@ -105,6 +99,7 @@ def run_common_frequency(args: argparse.Namespace) -> None:
     if not args.no_vae:
         try:
             import torch  # noqa: F401
+            from nowcasting.models.vae import VAENowcast
             models["VAE"] = VAENowcast(
                 target_col=target_name,
                 latent_dim=args.vae_latent_dim,

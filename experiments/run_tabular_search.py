@@ -1,7 +1,4 @@
 """
-run_tabular_search.py  —  ElasticNet & LightGBM Grid-Search Experiment Runner
-===============================================================================
-
 Systematic search over:
   - Feature selection / compression methods  (none, corr_top_n, variance_filter,
     lasso, elasticnet, pca, factor_analysis)
@@ -505,8 +502,7 @@ def optuna_objective(
         model_params["min_child_samples"] = trial.suggest_int("lgbm_min_child", 5, 50)
         model_params["subsample"] = trial.suggest_float("lgbm_subsample", 0.5, 1.0)
         model_params["colsample_bytree"] = trial.suggest_float("lgbm_colsample", 0.5, 1.0)
-        
-        # In lightgbm reg_alpha can be 0.0 to 1.0. Suggesting from 1e-4 but include 0? We'll just suggest from 1e-4.
+
         model_params["reg_alpha"] = trial.suggest_float("lgbm_alpha", 1e-4, 1.0, log=True)
         model_params["reg_lambda"] = trial.suggest_float("lgbm_lambda", 1e-4, 1.0, log=True)
 
@@ -738,7 +734,6 @@ def main() -> None:
         run_evaluation_engine(X_panel, y_target, args, out_path.parent, suffix_base)
         return
 
-    # Fallback to standard grid/staged below...
     grid = generate_grid(args)
     logger.info(f"Generated {len(grid)} experiment configurations.")
     if not grid:

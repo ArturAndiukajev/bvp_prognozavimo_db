@@ -1,10 +1,10 @@
 """
-run_bridge_search.py - Bridge Equation Grid Search & Feature Selection Experiment Pipeline
-==========================================================================================
-
-Executes a grid search over Bridge Equation hyperparameters, regression models,
-and feature selection strategies. Parallelizes outer loops to speed up backtesting.
-Resulting combinations are sorted by RMSE/MAE and exported to CSV.
+Bridge Equation hiperparametrų paieškos ir požymių atrankos eksperimentų vykdymo
+pipeline'as. Vykdo grid search per Bridge equation hiperparametrus, regresijos modelius
+ir požymių atrankos strategijas. Išoriniai ciklai paralelizuojami,
+kad būtų paspartintas backtest'inimas. Gauti modelių deriniai
+surūšiuojami pagal RMSE/MAE ir eksportuojami į CSV failą. Taip pat yra geriausių
+parametrų paieška su Optuna.
 """
 
 from __future__ import annotations
@@ -17,8 +17,6 @@ import os
 import random
 import time
 from typing import Any, Dict, List
-
-from joblib import Parallel, delayed
 import pandas as pd
 import optuna
 
@@ -91,7 +89,6 @@ def build_experiment_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ae-latent-dims", type=str, default="3,5")
     ap.add_argument("--fast-screen-top-k", type=str, default="50,100")
 
-    # Time rules
     ap.add_argument("--train-windows", type=str, default="120", help="Initial train window sizes.")
     ap.add_argument("--step-sizes", type=str, default="1", help="Backtest step sizes.")
     ap.add_argument(
@@ -466,22 +463,19 @@ def run_evaluation_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argp
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    # Robust parsing of nested JSON strings (e.g. from results CSV exports)
     def _parse_if_str(val):
         if isinstance(val, str):
             try: return json.loads(val)
             except: return val
         return val
 
-    # Extract configuration parts
     eval_config = {}
     for k, v in config.items():
         if k not in ["rmse", "mae", "status", "runtime_sec", "n_eval_points", "n_folds", "error_message"]:
             eval_config[k] = _parse_if_str(v)
 
     logger.info(f"Evaluating Bridge with config from {args.config_path}")
-    
-    # Wrap in single-item grid for checkpoint system
+
     search_grid = [eval_config]
     
     run_signature = build_run_signature(
@@ -725,7 +719,6 @@ def main():
 
     success = success.sort_values("rmse", ascending=True).reset_index(drop=True)
 
-    # Keep full output: successful runs first, then failed runs
     failures = df_res[df_res["status"] != "success"].copy()
     failures = failures.sort_values(by=["status"]).reset_index(drop=True)
     df_out = pd.concat([success, failures], ignore_index=True)

@@ -1,25 +1,16 @@
 """
-run_tactis_experiment.py  —  Unified TACTiS Grid & Optuna Experiment Runner
-=============================================================================
-
-Unifies the hyperparameter search pipelines (Grid, Staged, and Optuna) into one script
-with a shared evaluation loop `eval_tactis_config()`.
-
-Engines:
-  --engine optuna : Bayesian search over a vast parameter space via Optuna.
-  --engine grid   : Exhaustive grid search over specified parameter lists.
-  --engine staged : Coarse grid search followed by fine grid search on top configs.
-
-Warnings:
-- Optuna is recommended for broader searches over TACTiS because of the model's cost.
-- This script correctly dumps heavy artifacts (e.g. predictions) to disk immediately 
-  to prevent OOM errors, rather than storing them in Optuna Trial User Attributes.
+Tai yra TACTiS Grid ir Optuna eksperimentų paleidimo skriptas
+Sujungia hiperparametrų paieškos metodus (Grid, Staged ir Optuna) į vieną skriptą
+su bendru vertinimo ciklu `eval_tactis_config()`.
+Paieškos režimai:
+--engine optuna : paieška per didelę parametrų erdvę naudojant Optuna.
+--engine grid   : Pilnas visų nurodytų parametrų kombinacijų perrinkimas.
+--engine staged : Dviejų etapų paieška (pirma grubus filtravimas, tada detalesnė analizė).
 """
 
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import logging
 import os
@@ -29,8 +20,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
+from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
@@ -345,9 +335,7 @@ def run_optuna_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse
     if args.study_storage:
         storage_url = args.study_storage
     else:
-        # Default to a SQLite DB inside the results directory
         db_path = out_dir / "tactis_optuna.db"
-        # Windows safe sqlite URI path handling
         storage_url = f"sqlite:///{db_path.absolute().as_posix()}"
         
     logger.info(f"Starting OPTUNA engine for {args.n_trials} trials.")
@@ -355,9 +343,6 @@ def run_optuna_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse
     logger.info(f"Storage: {storage_url}")
     
     sampler = optuna.samplers.TPESampler(seed=args.seed)
-    
-    # Hyperband is an aggressive pruner well-suited for rolling backtests.
-    # Bad configs will be stopped early iteratively without waiting for full CV folds.
     pruner = optuna.pruners.HyperbandPruner(min_resource=1, reduction_factor=3)
     
     study = optuna.create_study(
@@ -368,8 +353,7 @@ def run_optuna_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse
         sampler=sampler, 
         pruner=pruner
     )
-    
-    # Check if we are resuming an existing study with completed trials
+
     initial_best = float("inf")
     try:
         if len(study.best_trials) > 0:
@@ -393,7 +377,6 @@ def run_optuna_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse
             except Exception:
                 pass # Gracefully handle OS locking collisions from parallel nodes
 
-            
             try:
                 best_value = study.best_value
                 best_params = study.best_params

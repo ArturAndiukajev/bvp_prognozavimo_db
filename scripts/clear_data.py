@@ -1,3 +1,4 @@
+"""Failas skirtas ištrinti visus duomenis iš DB."""
 import logging
 import argparse
 from sqlalchemy import create_engine, text

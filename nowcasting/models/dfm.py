@@ -1,7 +1,4 @@
 """
-dfm.py — Dynamic Factor Model (Common-Frequency & Mixed-Frequency)
-===================================================================
-
 Common-frequency mode  (mixed_frequency=False):
     Uses statsmodels DynamicFactor.  Handles ragged edges via Kalman Filter.
 
@@ -95,8 +92,8 @@ class DynamicFactorNowcast(BaseNowcastModel):
         try:
             self.fitted_res_ = model.fit(method="powell", disp=False)
         except Exception as e:
-            logger.warning(f"[DFM-CF] Powell failed: {e}. Falling back to EM.")
-            self.fitted_res_ = model.fit(method="em", disp=False, maxiter=100)
+            logger.warning(f"[DFM-CF] Powell failed: {e}. Falling back to LBFGS.")
+            self.fitted_res_ = model.fit(method="lbfgs", disp=False, maxiter=100)
 
     # ------------------------------------------------------------------
     def _fit_mq(self, endog: pd.DataFrame) -> None:
@@ -171,12 +168,7 @@ class DynamicFactorNowcast(BaseNowcastModel):
             pass
 
         try:
-            # TRUE CONDITIONAL NOWCASTING
-            # We append the test period observations (where predictors are known but target is NaN).
-            # The Kalman Filter will smooth through the new observations and generate an optimal target estimate.
             extended_res = self.fitted_res_.append(test_endog, refit=False)
-            
-            # The appended portion contains our nowcast (fittedvalues for the target col)
             predictions = extended_res.fittedvalues[self.target_col].iloc[-len(X_test):]
             return pd.Series(predictions.values, index=X_test.index, name=f"{self.target_col}_pred")
         except Exception as e:

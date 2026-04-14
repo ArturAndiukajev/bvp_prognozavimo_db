@@ -1,7 +1,4 @@
 """
-bvar.py - Bayesian Vector Autoregression with Minnesota Prior
-=============================================================
-
 Provides two classes:
 
     VARNowcast  – baseline frequentist VAR (statsmodels).

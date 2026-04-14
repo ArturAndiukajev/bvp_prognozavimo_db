@@ -1,3 +1,4 @@
+"""Šitas failas skirtas vintag'ų gavimui."""
 import pandas as pd
 from sqlalchemy import create_engine, text
 from datetime import datetime, date

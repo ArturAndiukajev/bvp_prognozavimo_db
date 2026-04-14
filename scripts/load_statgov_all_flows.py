@@ -1,3 +1,9 @@
+"""
+Šitas failas skirtas statistikos departamento duomenims atsiųsti.
+Jis atsisiunčia duomenų katalogą, atrenka srautus pagal filtrus,
+ir paralleliai vykdo jų įkėlimą naudodamas vieno srauto apdorojimo modulį.
+Taip pat palaikomas klaidų pakartojimas (retry) ir rezultatų stebėjimas.
+"""
 import argparse
 import logging
 import re
@@ -109,24 +115,21 @@ def run_one_flow_with_retry(
     return flow_id, False, last_err
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Ingest ALL StatGov OSP flows using load_statgov_one_flow.ingest_one_flow()")
-    ap.add_argument("--start", default=None)
-    ap.add_argument("--end", default=None)
-    ap.add_argument("--debug-title", action="store_true")
-
-    ap.add_argument("--include", default=None, help="Regex: only ingest flows whose id matches")
-    ap.add_argument("--exclude", default=None, help="Regex: skip flows whose id matches")
-
-    ap.add_argument("--offset", type=int, default=0)
-    ap.add_argument("--limit", type=int, default=None)
-
-    ap.add_argument("--workers", type=int, default=2)
-    ap.add_argument("--retries", type=int, default=2)
-    ap.add_argument("--retry-sleep", type=float, default=2.0)
-
-    args = ap.parse_args()
-
+def main(
+    mode: str = "initial",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    debug_title: bool = False,
+    include: Optional[str] = None,
+    exclude: Optional[str] = None,
+    offset: int = 0,
+    limit: Optional[int] = None,
+    workers: int = 2,
+    retries: int = 2,
+    retry_sleep: float = 2.0,
+) -> None:
+    logger.info(f"StatGov Master Ingestion started (mode={mode}, workers={workers})")
+    
     logger.info("Fetching SDMX dataflow catalog once...")
     catalog_xml = fetch_dataflow_catalog_bytes(timeout=90)
 
@@ -137,8 +140,8 @@ def main() -> None:
 
     patch_loader_catalog_cache(catalog_xml, flow_agency)
 
-    include_re = re.compile(args.include) if args.include else None
-    exclude_re = re.compile(args.exclude) if args.exclude else None
+    include_re = re.compile(include) if include else None
+    exclude_re = re.compile(exclude) if exclude else None
 
     filtered: List[str] = []
     for fid in flow_ids:
@@ -148,16 +151,16 @@ def main() -> None:
             continue
         filtered.append(fid)
 
-    if args.offset:
-        filtered = filtered[args.offset:]
-    if args.limit is not None:
-        filtered = filtered[: args.limit]
+    if offset:
+        filtered = filtered[offset:]
+    if limit is not None:
+        filtered = filtered[:limit]
 
     if not filtered:
         logger.info("No flows to ingest after filtering.")
         return
 
-    logger.info(f"Will ingest {len(filtered)} flows (workers={args.workers}).")
+    logger.info(f"Will ingest {len(filtered)} flows (workers={workers}).")
 
     ok_count = 0
     fail_count = 0
@@ -165,16 +168,16 @@ def main() -> None:
     # Store: (flow_id, dataset_name, error)
     failures: List[Tuple[str, Optional[str], str]] = []
 
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
         futs = [
             ex.submit(
                 run_one_flow_with_retry,
                 fid,
-                args.start,
-                args.end,
-                args.debug_title,
-                args.retries,
-                args.retry_sleep,
+                start,
+                end,
+                debug_title,
+                retries,
+                retry_sleep,
             )
             for fid in filtered
         ]
@@ -197,8 +200,41 @@ def main() -> None:
             name_str = name if name else "(no name in catalog)"
             logger.info(f"  {fid} - {name_str}: {err}")
 
-        sys.exit(1)
+        # In master runner mode, we might not want to exit(1), but for CLI we do.
+        # Check if called via CLI
+        if __name__ == "__main__":
+            sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description="Ingest ALL StatGov OSP flows using load_statgov_one_flow.ingest_one_flow()")
+    ap.add_argument("--mode", type=str, default="initial")
+    ap.add_argument("--start", default=None)
+    ap.add_argument("--end", default=None)
+    ap.add_argument("--debug-title", action="store_true")
+
+    ap.add_argument("--include", default=None, help="Regex: only ingest flows whose id matches")
+    ap.add_argument("--exclude", default=None, help="Regex: skip flows whose id matches")
+
+    ap.add_argument("--offset", type=int, default=0)
+    ap.add_argument("--limit", type=int, default=None)
+
+    ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--retries", type=int, default=2)
+    ap.add_argument("--retry-sleep", type=float, default=2.0)
+
+    args = ap.parse_args()
+    
+    main(
+        mode=args.mode,
+        start=args.start,
+        end=args.end,
+        debug_title=args.debug_title,
+        include=args.include,
+        exclude=args.exclude,
+        offset=args.offset,
+        limit=args.limit,
+        workers=args.workers,
+        retries=args.retries,
+        retry_sleep=args.retry_sleep
+    )

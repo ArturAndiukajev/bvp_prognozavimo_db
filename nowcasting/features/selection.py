@@ -30,7 +30,7 @@ class MultiStageFeatureSelector(BaseEstimator, TransformerMixin):
         logger.info(f"Fitting selector ({self.method}) on shape {X.shape}...")
         
         # 1. Always drop zero/low variance globally
-        X_clean = X.fillna(0) # For learning relations, fillna is ok. PCA can't take NaNs.
+        X_clean = X.fillna(0)
         self.var_thresh_.fit(X_clean)
         X_clean = X_clean.loc[:, self.var_thresh_.get_support()]
 
@@ -40,13 +40,12 @@ class MultiStageFeatureSelector(BaseEstimator, TransformerMixin):
             self.pca_.set_params(n_components=actual_n_components)
             self.pca_.fit(X_clean)
         elif self.method == "mutual_info" and y is not None:
-            # We must drop target NAs for MI
+            #It is necessary to drop target NAs for MI
             valid_idx = y.notna()
             mi_scores = mutual_info_regression(X_clean.loc[valid_idx], y.loc[valid_idx])
             mi_series = pd.Series(mi_scores, index=X_clean.columns)
             self.selected_features_ = mi_series.nlargest(self.n_components).index.tolist()
         else:
-            # Fallback for pure variance / correlation (not fully implemented)
             self.selected_features_ = X_clean.columns.tolist()
 
         return self
@@ -54,7 +53,7 @@ class MultiStageFeatureSelector(BaseEstimator, TransformerMixin):
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         logger.info(f"Transforming features using {self.method}...")
         
-        X_clean = X.fillna(0) # For application
+        X_clean = X.fillna(0)
         
         try:
             X_clean = X_clean.loc[:, self.var_thresh_.get_support()]

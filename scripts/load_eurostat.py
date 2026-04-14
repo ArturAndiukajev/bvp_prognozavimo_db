@@ -1,4 +1,10 @@
-﻿# load_eurostat.py
+﻿"""
+Šitas failas skirtas eurostat duomenims atsiųsti.
+automatiškai atsisiunčia pasirinktus duomenų rinkinius, pritaiko filtrus,
+išsaugo neapdorotus duomenis, transformuoja juos į laiko eilučių formatą ir įrašo į
+duomenų bazę. Taip pat užtikrina duomenų versijavimą, pokyčių tikrinimą bei įkėlimo
+rezultatų registravimą. Yra parallelizavimas.
+"""
 import logging
 import re
 import json
@@ -35,7 +41,6 @@ engine = get_engine(pool_size=5, max_overflow=5)
 RAW_DIR = Path("data/raw/eurostat")
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "datasets.yaml"
 FALLBACK_CONFIG = Path(__file__).with_name("datasets.yaml")
 
@@ -43,8 +48,7 @@ FALLBACK_CONFIG = Path(__file__).with_name("datasets.yaml")
 def load_config() -> dict:
     return load_config_first_existing([CONFIG_PATH, FALLBACK_CONFIG])
 
-
-# TIME parsing
+#TIME parsing
 _RE_YQ = re.compile(r"^(\d{4})[- ]?Q([1-4])$", re.I)
 _RE_YM = re.compile(r"^(\d{4})[- ]?M(\d{1,2})$", re.I)
 _RE_Y_MM = re.compile(r"^(\d{4})-(\d{2})$")
@@ -53,7 +57,7 @@ _RE_YMD = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 
 
 def to_period_date(x: Any) -> date:
-    """Convert Eurostat time labels into a date aligned to period start."""
+    """Funkcija konvertuoja eurostato laiko žymas į gerą datos pradžios formatą."""
     if isinstance(x, (pd.Timestamp, datetime)):
         return x.date()
 
@@ -92,6 +96,7 @@ def to_period_date(x: Any) -> date:
 
 
 def detect_time_columns(df: pd.DataFrame) -> list[str]:
+    """Funkcija ieško laiko stulpelius"""
     time_cols = []
     for c in df.columns:
         cs = str(c)
@@ -101,6 +106,7 @@ def detect_time_columns(df: pd.DataFrame) -> list[str]:
 
 
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    """Funkcija taiko filtrus dataframe'ui pagal nustatytus kriterijus"""
     if not filters:
         return df
     out = df
@@ -111,6 +117,7 @@ def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
 
 
 def normalize_dim_value(v: Any) -> Optional[str]:
+    """Funkcija normalizuoja duomenis ir keičia tuščias reikšmes į None"""
     if v is None:
         return None
     if isinstance(v, float) and pd.isna(v):
@@ -119,11 +126,13 @@ def normalize_dim_value(v: Any) -> Optional[str]:
 
 
 def build_series_key(dataset_code: str, dims: Dict[str, Any], dim_cols: list[str]) -> str:
+    """Funkcija sukuria unikalų raktą"""
     parts = [f"{k}={normalize_dim_value(dims.get(k))}" for k in dim_cols]
     return f"{dataset_code}." + ".".join(parts)
 
 
 def guess_country(dims: Dict[str, Any]) -> str:
+    """Funkcija paima šalies pavadinimą arba grąžina EU pagal nutylėjimą"""
     for k in ("geo", "GEO"):
         if k in dims and dims[k] is not None:
             return str(dims[k])
@@ -131,6 +140,7 @@ def guess_country(dims: Dict[str, Any]) -> str:
 
 
 def guess_frequency(dims: Dict[str, Any], time_label: Any) -> str:
+    """Funkcija nustato duomenų dažnį"""
     if "freq" in dims and dims["freq"] is not None:
         return str(dims["freq"])
     s = str(time_label)
@@ -142,10 +152,14 @@ def guess_frequency(dims: Dict[str, Any], time_label: Any) -> str:
 
 
 def fetch_dataset(dataset_code: str) -> pd.DataFrame:
+    """Funkcija gauna datasetą iš eurostato su API pagalba"""
     return eurostat.get_data_df(dataset_code)
 
 
 def ingest_dataset(dataset_code: str, dataset_cfg: dict, mode: str = "initial"):
+    """Funkcija padaro pilną dataseto apdorojimo ciklą - atsiunčia,
+    filtruoja, išsaugo, atsižvelgia į relizą ir sudeda į DB. Yra hashas - leidžia
+    atnaujinti duomenis be atsiuntimo iš naujo - tiesiog prideda naujas reikšmes."""
     filters = dataset_cfg.get("filters", {}) if isinstance(dataset_cfg, dict) else {}
     dataset_name = dataset_cfg.get("name", dataset_code) if isinstance(dataset_cfg, dict) else dataset_code
 

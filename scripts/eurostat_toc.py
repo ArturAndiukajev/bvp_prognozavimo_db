@@ -1,3 +1,4 @@
+"""Šitas failas skirtas gauti eurostato duomenų rinkinių pavadinimus (table of content)."""
 import hashlib
 import logging
 from datetime import datetime, timezone
@@ -16,7 +17,7 @@ def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 def download_toc(lang: str = "en", agency: str = "all") -> pd.DataFrame:
-    # eurostat.get_toc_df() exists in this package :contentReference[oaicite:1]{index=1}
+    #eurostat.get_toc_df() exists in this package :contentReference[oaicite:1]{index=1}
     toc_df = eurostat.get_toc_df(agency=agency, lang=lang)
     if toc_df is None or toc_df.empty:
         raise RuntimeError("TOC is empty")

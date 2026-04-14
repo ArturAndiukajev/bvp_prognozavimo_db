@@ -1,3 +1,6 @@
+"""
+Šitas failas skirtas sukurti duomėnų bazės schemą.
+"""
 import os
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
@@ -23,7 +26,7 @@ DROP TABLE IF EXISTS datasets CASCADE;
 DROP TABLE IF EXISTS providers CASCADE;
 
 -- ============================================================
--- providers = original source system
+-- providers = original source name
 --   e.g. 'eurostat', 'alfred', 'yahoo_finance', 'google_trends', 'fredmd'
 -- ============================================================
 CREATE TABLE providers (
@@ -35,7 +38,7 @@ CREATE TABLE providers (
 );
 
 -- ============================================================
--- datasets = one logical dataset inside a provider
+-- datasets = one dataset inside a provider
 --   eurostat: table code  (e.g. 'nama_10_gdp')
 --   alfred:   FRED series (e.g. 'GDP', 'CPI')
 --   yahoo:    ticker      (e.g. '^GSPC')
@@ -47,7 +50,7 @@ CREATE TABLE datasets (
   provider_id   BIGINT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
 
   key           TEXT NOT NULL,        -- stable identifier within provider
-  title         TEXT,                 -- human-readable title (optional)
+  title         TEXT,                 -- readable title (optional)
   description   TEXT,
   meta          JSONB NOT NULL DEFAULT '{}'::jsonb,
 

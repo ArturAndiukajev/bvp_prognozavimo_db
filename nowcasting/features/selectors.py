@@ -1,9 +1,6 @@
 """
-selectors.py - Sklearn-compatible feature selectors and compressors
-===================================================================
-
 Provides standardized transformers for grid-searching feature engineering 
-before passing data to models (e.g., Dynamic Factor Models).
+before passing data to models.
 """
 
 import logging

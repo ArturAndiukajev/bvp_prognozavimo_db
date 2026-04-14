@@ -1,4 +1,10 @@
-﻿import os
+﻿"""
+Šitas failas skirtas alfred šaltinio duomenims atsiųsti.
+Taip pat užtikrina duomenų versijavimą bei įkėlimo
+rezultatų registravimą. Yra parallelizavimas. Turi vintag'ų - kai duomenys yra
+peržiūrimi po tam tikro laiko.
+"""
+import os
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -6,8 +12,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 from fredapi import Fred
-from sqlalchemy import text
-
 from scripts.db_helpers import (
     get_engine,
     Timer,
@@ -28,7 +32,6 @@ logger = logging.getLogger("alfred")
 
 engine = get_engine(pool_size=5, max_overflow=5)
 
-
 API_KEY = os.environ.get("FRED_API_KEY")
 if not API_KEY:
     logger.warning("FRED_API_KEY not found in environment. ALFRED loading will fail.")
@@ -40,29 +43,36 @@ FALLBACK_CONFIG = Path(__file__).with_name("datasets.yaml")
 
 
 def _load_config() -> dict:
+    """Nuskaito konfigūraciją"""
     return load_config_first_existing([CONFIG_PATH, FALLBACK_CONFIG])
 
 
 def _ensure_tz_utc(dt) -> datetime:
+    """UTC formatas"""
     if getattr(dt, "tzinfo", None) is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
 
 def fetch_series_info(series_key: str):
+    """Gaunami metaduomenus"""
     return fred.get_series_info(series_key)
 
 
 def fetch_vintage_dates(series_key: str):
+    """Gauna vintagų sąrašą"""
     return fred.get_series_vintage_dates(series_key)
 
 
 def fetch_series_vintage(series_key: str, vintage_at: datetime) -> pd.Series:
+    """Gauna eilutės reikšmes, kurios buvo žinomos tam tikrą datą."""
     v_str = vintage_at.strftime("%Y-%m-%d")
     return fred.get_series(series_key, realtime_start=v_str, realtime_end=v_str)
 
 
 def ingest_one_series(series_key: str, realtime: bool, max_vintages: int, mode: str) -> dict:
+    """Surenka laiko eilutes informaciją, nustato kokius vintag'us reikia surinkti,
+    įkelia viską į db."""
     if not fred:
         return {"series": series_key, "status": "fail", "error": "fred client not initialized"}
 

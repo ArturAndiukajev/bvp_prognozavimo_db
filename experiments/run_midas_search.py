@@ -1,7 +1,4 @@
 """
-run_midas_search.py  —  MIDAS / U-MIDAS Grid-Search Experiment Pipeline
-========================================================================
-
 Systematic search over:
   - Feature selection / compression methods
   - MIDAS hyperparameters  (n_lags, freq_ratio, lf_freq, fill_strategy)
@@ -767,7 +764,6 @@ def main() -> None:
         run_evaluation_engine(X_panel, y_target, args, out_path.parent, suffix_base)
         return
 
-    # Fallback to standard grid/staged below...
     grid = generate_grid(args)
     logger.info(f"Generated {len(grid)} experiment configurations.")
     if not grid:

@@ -1,7 +1,4 @@
 """
-tactis_wrapper.py  —  TACTiS Forecasting Wrapper (Dense API)
-================================================================
-
 Key improvements over the original:
 1. **Plain Forecasting (No Data Hallucination)**: 
    This wrapper acts as a pure unconditional forecaster, drawing on the memory of the sequence seen in `train_tail`.

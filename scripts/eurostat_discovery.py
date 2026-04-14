@@ -1,3 +1,8 @@
+"""
+Šis failas skirtas tinkamų Eurostat duomenų rinkinių paieškai ir atrankai.
+Jis analizuoja Eurostat katalogą (TOC) ir atrenka tuos duomenų rinkinius,
+kurie turi geo dimensiją, palaiko pasirinktą šalį ir bent vieną reikiamą dažnį.
+"""
 import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple

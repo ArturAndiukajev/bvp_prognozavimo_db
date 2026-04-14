@@ -1,3 +1,6 @@
+"""
+Šitas failas skirtas patikrinti esančius datasetus duombazėje.
+"""
 import pandas as pd
 from sqlalchemy import create_engine
 

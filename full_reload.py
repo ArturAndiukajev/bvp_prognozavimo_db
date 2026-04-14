@@ -1,3 +1,4 @@
+"""Šitas failas atnaujina schemą ir visus duomenis"""
 import logging
 import create_schema
 from scripts import load_fredmd
@@ -5,6 +6,7 @@ from scripts import load_alfred
 from scripts import load_eurostat
 from scripts import load_google_trends
 from scripts import load_financials
+from scripts import load_statgov_all_flows
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("FullReload")
@@ -58,6 +60,14 @@ def main():
     except Exception as e:
         print(f"Financials failed: {e}")
         logger.error(f"Financials failed: {e}")
+
+    try:
+        print("--- StatGov OSP ---")
+        logger.info("--- StatGov OSP ---")
+        load_statgov_all_flows.main(mode="initial", workers=2)
+    except Exception as e:
+        print(f"StatGov OSP failed: {e}")
+        logger.error(f"StatGov OSP failed: {e}")
     print("=== Full Reload Complete ===")
     logger.info("=== Full Reload Complete ===")
 

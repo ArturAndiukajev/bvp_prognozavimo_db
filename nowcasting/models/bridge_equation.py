@@ -1,7 +1,4 @@
 """
-bridge_equation.py — Bridge Equation Nowcast Model
-===================================================
-
 A two-stage mixed-frequency nowcasting approach:
 
 Stage 1 (Bridge):
@@ -12,11 +9,6 @@ Stage 1 (Bridge):
 Stage 2 (Regression):
     Aggregate the (real + forecasted) high-frequency predictors to the low
     frequency, then run an ElasticNetCV regression of the target on them.
-
-References
-----------
-Baffigi, A., Golinelli, R., & Parigi, G. (2004). Bridge models to forecast
-the euro area GDP. *International Journal of Forecasting*, 20(3), 447-460.
 """
 
 from __future__ import annotations

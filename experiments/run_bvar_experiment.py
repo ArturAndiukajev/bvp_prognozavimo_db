@@ -1,11 +1,8 @@
 """
-run_bvar_experiment.py - BVAR & VAR Grid Search Experiment Pipeline
-====================================================================
-
 Runs a systematic grid search over VAR/BVAR hyperparameters and feature
 selection strategies. Supports optional parallel execution via joblib.
 
-Example (quick smoke test):
+Example (quick test):
     python scripts/run_bvar_experiment.py \\
         --modes bvar,var \\
         --lags 1,2,3 \\
@@ -46,12 +43,11 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
 import optuna
-from joblib import Parallel, delayed
 
 # Force single-thread BLAS in parallel workers
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -533,22 +529,19 @@ def run_evaluation_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argp
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
-    # Robust parsing of nested JSON strings (e.g. from results CSV exports)
     def _parse_if_str(val):
         if isinstance(val, str):
             try: return json.loads(val)
             except: return val
         return val
 
-    # Extract configuration parts
     eval_config = {}
     for k, v in config.items():
         if k not in ["rmse", "mae", "mape", "status", "runtime_sec", "n_eval_points", "n_folds", "error_message", "n_raw_features", "n_trans_features", "n_sel_features", "n_model_used_vars"]:
             eval_config[k] = _parse_if_str(v)
 
     logger.info(f"Evaluating BVAR with config from {args.config_path}")
-    
-    # Wrap in single-item grid for checkpoint system
+
     search_grid = [eval_config]
     
     run_signature = build_run_signature(
@@ -606,7 +599,6 @@ def main() -> None:
     ap   = build_experiment_parser()
     args = ap.parse_args()
 
-    # Seed everything at the top level
     random.seed(args.seed)
     np.random.seed(args.seed)
 

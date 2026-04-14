@@ -1,12 +1,14 @@
-﻿import logging
+﻿"""
+Šitas failas skirtas fredmd šaltinio duomenims atsiųsti. Apdoroja duomenų failą,
+išsaugo, patikrina pakeitimus pagal hash reikšmę ir įkelia duomenis į db.
+"""
+import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Tuple, Dict
 
 import pandas as pd
 import requests
-from sqlalchemy import text
-
 from scripts.db_helpers import (
     get_engine,
     Timer,
@@ -27,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("fredmd")
 
 
-engine = get_engine(pool_size=3, max_overflow=3)
+engine = get_engine(pool_size=5, max_overflow=5)
 
 
 RAW_DIR = Path("data/raw")
@@ -51,6 +53,7 @@ def get_fredmd_url() -> str:
 
 
 def download_current_fredmd_csv() -> Tuple[Path, datetime]:
+    """Funkcija gauna naujausi1 fredmd duomenų failą, užrašo, kada jis buvo atsiųstas."""
     url = get_fredmd_url()
     downloaded_at = datetime.now(timezone.utc)
     stamp = downloaded_at.strftime("%Y-%m-%dT%H%M%SZ")
@@ -66,7 +69,7 @@ def download_current_fredmd_csv() -> Tuple[Path, datetime]:
 
 
 def parse_fredmd(csv_path: Path) -> Tuple[pd.DataFrame, Dict]:
-    """Returns df_wide (index=dates, columns=variables) and meta (e.g. tcodes)."""
+    """Grąžina df_wide (indeksas=data, stulpialaii=kintamieji) ir meta (pvz. tcodes)."""
     df = pd.read_csv(csv_path)
     first_col = df.columns[0]
     meta: Dict = {}

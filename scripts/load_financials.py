@@ -1,4 +1,11 @@
-﻿import logging
+﻿"""
+Šitas failas skirtas yahoo finances šaltinio duomenims atsiųsti.
+automatiškai atsisiunčia pasirinktus duomenų rinkinius, pritaiko filtrus,
+išsaugo neapdorotus duomenis, transformuoja juos į laiko eilučių formatą ir įrašo į
+duomenų bazę. Taip pat užtikrina pokyčių tikrinimą bei įkėlimo
+rezultatų registravimą. Yra parallelizavimas. Naudojami tikeriai - akcijų pavadinimai.
+"""
+import logging
 from pathlib import Path
 from datetime import datetime, timezone, date
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -6,7 +13,6 @@ from typing import Optional
 
 import pandas as pd
 import yfinance as yf
-from sqlalchemy import text
 
 from scripts.db_helpers import (
     get_engine,
@@ -28,16 +34,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("yahoo_finance")
 
 
-# DB
+#DB
 engine = get_engine(pool_size=5, max_overflow=5)
-
-
-# Paths
 RAW_DIR = Path("data/raw/yahoo_finance")
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# Config
+#Config
 CONFIG_PATH = Path(__file__).parent.parent / "config" / "datasets.yaml"
 FALLBACK_CONFIG = Path(__file__).with_name("datasets.yaml")
 
@@ -47,9 +49,9 @@ def _load_config() -> dict:
 
 
 # -------------------- Fetch + Prepare --------------------
-
-
 def fetch_yahoo_history(ticker: str, period: str, start: Optional[date]) -> pd.DataFrame:
+    """Funkcija atsisiunčia duomenis pagal tikerį iš Yahoo Finance.
+    Paima duomenis nuo nurodyto starto arba nuo periodo."""
     t = yf.Ticker(ticker)
     if start is not None:
         return t.history(start=str(start))
@@ -57,6 +59,7 @@ def fetch_yahoo_history(ticker: str, period: str, start: Optional[date]) -> pd.D
 
 
 def prepare_rows_for_copy(series_id: int, df_close: pd.DataFrame, vintage_at: datetime, release_id: int) -> list:
+    """"Funkcija paruošia duomenis įkėlimui į DB. Grąžina sąrašą."""
     df_close = df_close.dropna(subset=["Close"]).copy()
     if df_close.empty:
         return []
@@ -68,8 +71,6 @@ def prepare_rows_for_copy(series_id: int, df_close: pd.DataFrame, vintage_at: da
 
 
 # -------------------- One ticker ingestion --------------------
-
-
 def ingest_one_ticker(
     ticker: str,
     details,
@@ -79,7 +80,10 @@ def ingest_one_ticker(
     stamp: str,
     tail_days_default: int,
 ) -> dict:
-    # config parsing
+    """Funkcija nuskaito tikerio nustatymus, nustato ar reikia atsisiųsti visus duomenis
+    ar tik trūkstamą dalį, įšsaugo rezultatus į csv failą, skaito hashą, turi 'update'
+    režimą, sukuria relizą, viską įkelia į DB."""
+    #config parsing
     if isinstance(details, dict):
         name = details.get("name", ticker)
         period = details.get("period", "5y")
@@ -89,7 +93,7 @@ def ingest_one_ticker(
         period = "5y"
         tail_days = tail_days_default
 
-    # decide incremental window
+    #decide incremental window
     start: Optional[date] = None
     fetch_mode_label = f"period={period}"
     with engine.begin() as conn:
@@ -117,7 +121,6 @@ def ingest_one_ticker(
 
     logger.info(f"Yahoo Finance: {ticker} ({name}) [{mode}] {fetch_mode_label}")
 
-    # fetch outside DB transaction
     try:
         with Timer(f"Yahoo fetch {ticker}"):
             hist = fetch_yahoo_history(ticker, period=period, start=start)
