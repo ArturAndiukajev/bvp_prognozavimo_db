@@ -83,7 +83,7 @@ class DynamicFactorNowcast(BaseNowcastModel):
             endog,
             k_factors=min(self.k_factors, endog.shape[1] - 1),
             factor_order=self.factor_order,
-            enforce_stationarity=False,
+            enforce_stationarity=True,
         )
         logger.info(
             f"[DFM-CF] Fitting DynamicFactor ({self.k_factors} factors, AR({self.factor_order})) "

@@ -33,39 +33,12 @@ Norint sėkmingai paruošti ir naudoti „nowcasting“ sistemą, rekomenduojama
    - PALEIDIMAS: `python run_updates.py`
 
 5. DUOMENŲ PARUOŠIMAS MODELIAVIMUI.
-   - Sujunkite visas laiko eilutes į vieną panelį, sutvarkykite stacionarumą ir transformacijas.
-   - PALEIDIMAS: `python scripts/data_preparation.py --mode common_frequency --target BVP_SA`
+   - Duomenų bazėje esančios lentelių eilutės nėra iš karto tinkamos modeliams. Tuomet
+     naudojamas pagrindinis paruošimo skriptas.
+   - PALEIDIMAS: `python scripts/data_preparation.py --mode common_frequency --target GDP1`
    - Tai sukurs apdorotus failus (pvz., .parquet) `data/processed/` kataloge.
 
-6. EKSPERIMENTŲ VYKDYMAS.
-   - Paleiskite modelių hiperparametrų paiešką ar backtesting'ą.
-   - PALEIDIMAS: `python experiments/run_tabular_search.py --engine staged` (arba kiti runner'iai).
-
-7. REZULTATŲ ANALIZĖ (DASHBOARD).
-   - Naudokite vizualizacijos įrankį prognozėms ir metrikoms stebėti.
-   - PALEIDIMAS: `streamlit run dashboard.py`
-
---------------------------------------------------------------------------------
-KAIP VEIKIA ŠIS PROJEKTAS? (BENDRA DUOMENŲ IR PROCESŲ EIGA)
---------------------------------------------------------------------------------
-Prieš pradedant analizuoti atskirus failus, svarbu suprasti, kaip duomenys keliauja
-projekto viduje (koks yra bendras "pipeline"):
-
-1. DUOMENŲ ATSISIUNTIMAS (ETL FAZĖ).
-   - Skriptai (`run_updates.py`, `run_ingest.py`, `load_new_source.py`) parsisiunčia
-     žalius duomenis iš Eurostat, FRED, Yahoo Finance ir kitų API.
-   - Šie neapdoroti duomenys (.csv/.json) išsaugomi `data/raw/` kataloge, o vėliau
-     sukeliami į PostgreSQL duomenų bazę.
-   - KAIP PALEISTI: `python run_updates.py`
-
-2. DUOMENŲ PARUOŠIMAS MODELIAMS.
-   - Duomenų bazėje esančios DB lentelių eilutės nėra iš karto tinkamos modeliams. Tuomet
-     naudojamas pagrindinis paruošimo skriptas. Jis sujungia datas (Pivot), sinchronizuoja ir
-     užpildo trūkstamas reikšmes, kad modeliai turėtų su kuo mokytis.
-   - Išvestis – sugeneruoti apdoroti failai `data/processed/` kataloge (pvz. parquet formatais).
-   - KAIP PALEISTI: `python scripts/data_preparation.py --mode common_frequency --target BVP_SA`
-
-3. MODELIŲ TRENIRAVIMAS IR TESTAVIMAS.
+6. MODELIŲ TRENIRAVIMAS IR TESTAVIMAS.
    - Paruošti duomenys paduodami į eksperimentų runner'ius iš `experiments/` katalogo.
    - Runner'iai treniruoja modelį pagal visą istoriją slenkančiu (backtesting) rėžimu:
      * `staged` / `grid` varikliai ieško geriausių nustatymų.
@@ -73,12 +46,11 @@ projekto viduje (koks yra bendras "pipeline"):
    - Rezultatai, metrikos ir prognozės išsaugomi `data/forecasts/`.
    - SISTEMOS TĘSTINUMAS (Checkpointing): Visi eksperimentai palaiko `--resume` funkciją, 
      leidžiančią tęsti nutrūkusį skaičiavimą arba praleisti jau atliktus testus.
-   - KAIP PALEISTI: `python experiments/run_tabular_search.py --models lightgbm --engine staged`
+   - KAIP PALEISTI: `python experiments/run_tactis_experiment.py --engine optuna`
 
-4. VARTOTOJO SĄSAJA (DASHBOARD).
-   - Naršyklėje veikiantis dashboard'as apjungia visas projekto dalis: skaito failus iš `data/forecasts/` 
-     grafikams brėžti, stebi sistemos būklę naršyklėje tiesiai iš PostgreSQL.
-   - KAIP PALEISTI: `streamlit run dashboard.py`
+7. REZULTATŲ ANALIZĖ (DASHBOARD).
+   - Naudokite vizualizacijos įrankį prognozėms ir metrikoms stebėti.
+   - PALEIDIMAS: `streamlit run dashboard.py`
 
 --------------------------------------------------------------------------------
 PART 1: DATA PREPARATION & EVALUATION
@@ -88,7 +60,7 @@ File: scripts/data_preparation.py
 ------------------------------------
 Paskirtis: Automatizuoja duomenų valymą, transformaciją ir agregavimą į tvarkingus
 parquet panelinius failus.
-Vaidmuo pipeline: Tai pirmasis etapas. Modeliai naudoja būtent čia sugeneruotus
+Vaidmuo pipeline: Modeliai naudoja būtent čia sugeneruotus
 parquet failus. Šis failas užtikrina, kad eilutės būtų stacionarios ir tvarko
 trūkstamas reikšmes.
 Numatytieji parametrai:
