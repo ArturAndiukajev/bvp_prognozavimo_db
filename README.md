@@ -1,20 +1,7 @@
 # bvp_prognozavimo_db
-Reikia sukurti .env faila savo projekto direktorijoje, ir tada gauti ALFRED duomenu API'u sioje nuorodoje https://fredaccount.stlouisfed.org/apikeys
-tada tenai irasyti FRED_API_KEY=
-po = irasyti savo gauta API.
-run_ingest. py iskarto praleidzia ALFRED, Eurostat ir google trends duomenu atsiuntyma.
-
-Šis projektas skirtas makroekonominių duomenų saugojimui ir realaus laiko (nowcasting / vintages) logikos palaikymui.
-Sistema kaupia:
-- **series** (laiko eilučių aprašus),
-- **observations** (reikšmes su `period_date` ir `observed_at`/vintage),
-- **releases** (kada atsisiųsta/įkelta ir koks tai snapshot/vintage),
-- **ingestion_log** (įkėlimo žurnalą).
-
-## Reikalavimai
-- Python 3.10+ (arba 3.11)
-- PostgreSQL (rekomenduojama per Docker)
-- `.env` failas su reikalingais raktai (pvz. `FRED_API_KEY` ALFRED/FRED šaltiniams)
+Reikia sukurti .env faila savo projekto direktorijoje, ir tada gauti ALFRED duomenu API'u šioje nuorodoje https://fredaccount.stlouisfed.org/apikeys
+tada tenai irašyti FRED_API_KEY=
+po = irašyti savo gauta API.
 
 ## Konfigūracija
 - `datasets.yaml` – nurodo, kokius šaltinius ir kokius rodiklius/datasets įkelti.
