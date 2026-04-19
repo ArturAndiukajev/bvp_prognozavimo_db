@@ -47,6 +47,8 @@ from typing import Dict, Any, List
 import pandas as pd
 import numpy as np
 import optuna
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.preprocessing import StandardScaler
 
 # Force single-thread linear algebra to prevent collision in parallel workers
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -72,6 +74,45 @@ from nowcasting.features.selectors import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("dfm_experiment")
+
+
+class WindowStandardScaler(BaseEstimator, TransformerMixin):
+    """
+    StandardScaler that operates on a single train window, preserving NaNs and
+    using medians for temporary imputation during scaling.
+    """
+    def __init__(self):
+        self.scaler_ = StandardScaler()
+        self.fill_values_ = None
+        self.columns_ = None
+
+    def fit(self, X, y=None):
+        self.columns_ = X.columns
+        # Compute median for imputation before scaling (only for numeric columns)
+        self.fill_values_ = X.median(numeric_only=True)
+        # Impute with median, then with 0 if medians are NaN (for constant columns)
+        X_filled = X.fillna(self.fill_values_).fillna(0.0)
+        self.scaler_.fit(X_filled)
+        return self
+
+    def transform(self, X):
+        if self.fill_values_ is None:
+            raise ValueError("Scaler must be fitted before transform.")
+        
+        # Save NaN mask to restore later
+        mask = X.isna()
+        
+        # Impute with stored train median
+        X_filled = X.fillna(self.fill_values_).fillna(0.0)
+        
+        # Scale
+        X_scaled = self.scaler_.transform(X_filled)
+        
+        # Reconstruct DataFrame
+        X_out = pd.DataFrame(X_scaled, index=X.index, columns=self.columns_)
+        
+        # Restore NaNs
+        return X_out.where(~mask, np.nan)
 
 
 def build_experiment_parser() -> argparse.ArgumentParser:
@@ -134,6 +175,7 @@ def build_experiment_parser() -> argparse.ArgumentParser:
     
     ap.add_argument("--resume", action="store_true", help="Resume from an interrupted search using existing results CSV.")
     ap.add_argument("--checkpoint-chunk-size", type=int, default=10, help="Save to CSV after completing this many configurations.")
+    ap.add_argument("--scale-x", action="store_true", help="Scale X per train window before feature selection/model fit")
     ap.add_argument("--out-file", type=str, default="data/forecasts/dfm_experiment_results.csv")
 
     return ap
@@ -168,11 +210,13 @@ def run_single_experiment(
     X_panel: pd.DataFrame, 
     y_target: pd.Series,
     search_mode: str,
-    search_last_n_steps: int
+    search_last_n_steps: int,
+    scale_x: bool = False
 ) -> dict:
     """Runs a single combination grid configuration and returns metrics."""
     res = {**config}
     res["status"] = "running"
+    res["scale_x"] = scale_x
     
     try:
         t0 = time.time()
@@ -194,13 +238,16 @@ def run_single_experiment(
             rolling_window_size=config.get("rolling_window_size")
         )
 
-        # 2. Selector Initialization
+        # 2. Transformer initialization (scaling)
+        scaler = WindowStandardScaler() if scale_x else None
+
+        # 3. Selector Initialization
         # VarianceFilter is always implicitly added in front to drop constants safely
         from sklearn.pipeline import make_pipeline
         base_sel = build_selector(config["selector_method"], config["selector_params"])
         selector = make_pipeline(VarianceFilter(), base_sel)
         
-        # 3. Model Initialization
+        # 4. Model Initialization
         k = config["dfm_k_factors"]
         fo = config["dfm_factor_order"]
         mod_kws = {}
@@ -225,7 +272,7 @@ def run_single_experiment(
                 model=model,
                 X_panel=X_panel,
                 y_target=y_target,
-                transformer=None,
+                transformer=scaler,
                 feature_selector=selector
             )
             
@@ -327,7 +374,8 @@ def optuna_objective(
         X_panel=X_panel,
         y_target=y_target,
         search_mode=args.search_mode,
-        search_last_n_steps=args.search_last_n_steps
+        search_last_n_steps=args.search_last_n_steps,
+        scale_x=getattr(args, "scale_x", False)
     )
     
     for k, v in res.items():
@@ -465,7 +513,8 @@ def run_evaluation_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argp
         "X_panel": X_panel,
         "y_target": y_target,
         "search_mode": args.search_mode,
-        "search_last_n_steps": args.search_last_n_steps
+        "search_last_n_steps": args.search_last_n_steps,
+        "scale_x": getattr(args, "scale_x", False)
     }
 
     results = run_chunks(pruned_grid, run_single_experiment, run_kwargs, out_path, n_jobs=1, chunk_sz=1, stage_name="Evaluation")
@@ -593,7 +642,8 @@ def main():
         "X_panel": X_panel,
         "y_target": y_target,
         "search_mode": args.search_mode,
-        "search_last_n_steps": args.search_last_n_steps
+        "search_last_n_steps": args.search_last_n_steps,
+        "scale_x": getattr(args, "scale_x", False)
     }
     
     out_path = Path(args.out_file)
@@ -706,7 +756,7 @@ def main():
             b_cfg = {k:v for k,v in best_cfg.items() if not str(k).startswith("_")}
             if isinstance(b_cfg.get('selector_params'), str):
                 b_cfg['selector_params'] = json.loads(b_cfg['selector_params'])
-            b_res = run_single_experiment(b_cfg, X_panel, y_target, args.search_mode, args.search_last_n_steps)
+            b_res = run_single_experiment(b_cfg, X_panel, y_target, args.search_mode, args.search_last_n_steps, scale_x=getattr(args, "scale_x", False))
             best_eval_df = b_res.get("_eval_df", pd.DataFrame())
 
         if not best_eval_df.empty:
