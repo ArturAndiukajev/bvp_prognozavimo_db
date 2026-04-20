@@ -1,48 +1,117 @@
-# bvp_prognozavimo_db
-Reikia sukurti .env faila savo projekto direktorijoje, ir tada gauti ALFRED duomenu API'u sioje nuorodoje https://fredaccount.stlouisfed.org/apikeys
-tada tenai irasyti FRED_API_KEY=
-po = irasyti savo gauta API.
-run_ingest. py iskarto praleidzia ALFRED, Eurostat ir google trends duomenu atsiuntyma.
+# GDP Nowcasting System
 
-Šis projektas skirtas makroekonominių duomenų saugojimui ir realaus laiko (nowcasting / vintages) logikos palaikymui.
-Sistema kaupia:
-- **series** (laiko eilučių aprašus),
-- **observations** (reikšmes su `period_date` ir `observed_at`/vintage),
-- **releases** (kada atsisiųsta/įkelta ir koks tai snapshot/vintage),
-- **ingestion_log** (įkėlimo žurnalą).
+A macroeconomic nowcasting system built with Python and PostgreSQL. This tool is designed to handle mixed-frequency and common-frequency data, perform backtesting without look-ahead bias, and compare various forecasting methodologies (DFM, BVAR, MIDAS, ML, Deep Learning) using automated hyperparameter optimization.
 
-## Reikalavimai
-- Python 3.10+ (arba 3.11)
-- PostgreSQL (rekomenduojama per Docker)
-- `.env` failas su reikalingais raktai (pvz. `FRED_API_KEY` ALFRED/FRED šaltiniams)
+## Key Features
+- **ETL Pipeline**: Automated data ingestion from Eurostat, FRED (ALFRED), StatGov, Yahoo Finance, and Google Trends.
+- **Mixed Frequency Support**: Dedicated models and data preparation for combining monthly and quarterly data.
+- **Robust Backtesting**: Forward-rolling evaluation framework ensuring no data leakage.
+- **Dynamic Factor Models (DFM)**: latent factor extraction for high-dimensional macroeconomic datasets.
+- **Deep Learning**: Integration with TACTiS (Transformer-based architecture).
+- **Dashboard**: Interactive Streamlit interface for results visualization and model monitoring.
 
-## Konfigūracija
-- `datasets.yaml` – nurodo, kokius šaltinius ir kokius rodiklius/datasets įkelti.
-  Pvz.:
-  - `alfred`: serijų sąrašas (FRED serijų ID)
-  - `eurostat`: dataset kodai + filtrai
-  - `google_trends`: keywords + geo + timeframe
-  - `yahoo_finance`: tickers + period (ir t.t.)
+---
 
-- `.env` – aplinkos kintamieji (pvz. `FRED_API_KEY`).
+## Quick Start Guide
 
-## Pagrindiniai valdymo skriptai
--`docker-compose.yml` - paleidžia PostgreSQL. Naudojamas lokaliam testavimui.
--`create_schema.py`- sukuria DB lenteles ir indeksus (schema). Naudoti, kai pirmą kartą reikia sukurti DB, arba po reset_db.py/DB išvalymo.
--`reset_db.py`- išvalo DB. Naudoti, kai reikia atstatyti sistemą nuo pat pradžios.
--`full_reload.py` - Atlieka pilną inicializaciją - sukuria schemą (arba tikrina, kad ji yra), paleidžia visus loaders, sukelia duomenis į DB. Naudoti integraciniam testui ir pirmajam pakrovimui.
--`run_updates.py` - paleidžia visų šaltinių update režimą - įkelia tik naujausius duomenis / naujus vintages, sukuria naujus release įrašus, neperrašo senų istorinių įrašų.
--`run_ingest.py` - paleidžia įkėlimą.
+### 1. Environment Setup
+Create a PostgreSQL database and configure your `.env` file. You will need a FRED API key for ALFRED data.
 
-## Duomenų šaltinių loader’iai
--`load_alfred.py` - įkelia duomenis iš ALFRED (FRED real-time vintages). Svarbu: observed_at = realus vintage laikas, tame pačiame period_date gali būti keli skirtingi observed_at → revisions. Reikalinga: .env su FRED_API_KEY.
--`fredmd.py` - įkelia FRED-MD panelę (iš current.csv). Tai snapshot tipo šaltinis: observed_at = snapshot laikas (kada atsisiųsta), revisions realizuojami kaip naujas snapshot (naujas observed_at).
--`load_eurostat.py` - įkelia pasirinktus Eurostat datasets pagal datasets.yaml. vienas dataset → daug series (skirtingi dimensijų deriniai), observed_at = snapshot laikas.
--`load_google_trends.py` - įkelia Google Trends pagal keywords, geo, timeframe. observed_at = snapshot laikas, duomenys gali „kisti“ laikui bėgant, todėl snapshot/hashed release yra svarbus.
--`load_financials.py` - įkelia finansinius duomenis iš Yahoo Finance (pvz. indeksai, akcijos). update režime paima tik „uodegą“ (pvz. paskutines N dienų).
+**How to get ALFRED API Key:**
+1. Create an account at [St. Louis Fed](https://fredaccount.stlouisfed.org/apikeys).
+2. Generate your API key.
+3. Add it to your `.env` file:
+   ```env
+   DB_URL=postgresql+psycopg2://user:password@localhost:5432/nowcast_db
+   FRED_API_KEY=your_key_here
+   ```
 
-## Patikros / diagnostikos skriptai
--`test_connection.py` - greitas DB prisijungimo testas.
--`check_db.py` - patikrina, ar lentelės egzistuoja, kiek yra series/observations/releases ir pan.
--`check_quality.py` - kokybės patikra: dublių paieška, ar nėra keistų tuščių reikšmių, ar logika tvarkinga.
--`get_vintage.py` - pagalbinis skriptas darbui su vintages (pvz. gauti vintage informaciją ar testuoti vintage logiką).
+### 2. Initialize Database
+Initialize the schema and tables.
+```bash
+python create_schema.py
+```
+*Note: This will wipe existing data in the database.*
+
+### 3. Data Ingestion
+Perform the initial data download.
+```bash
+python run_ingest.py --mode initial
+```
+For regular daily/weekly updates:
+```bash
+python run_updates.py
+```
+
+### 4. Data Preparation
+Transform raw database records into processed Parquet files suitable for modeling.
+```bash
+python scripts/data_preparation.py --mode common_frequency --target GDP1
+```
+
+### 5. Training & Backtesting
+Run experiments using the provided runners.
+```bash
+python experiments/run_dfm_experiment.py --engine optuna
+```
+Use `--resume` to continue interrupted experiments.
+
+### 6. Visualization
+Launch the dashboard to analyze forecasts and metrics.
+```bash
+streamlit run dashboard.py
+```
+
+---
+
+## Configuration
+
+- **`config/datasets.yaml`**: The central registry for data sources. Add or remove series IDs from Eurostat, FRED, etc., here.
+- **`alembic.ini`**: Configuration for database migrations.
+
+## Principal Control Scripts
+
+- **`docker-compose.yml`**: Spins up a local PostgreSQL instance.
+- **`create_schema.py`**: Initializes the DB schema.
+- **`scripts/clear_data.py`**: Performs a full database wipe using CASCADE login.
+- **`full_reload.py`**: Orchestrates a full system initialization (schema + initial ingest).
+- **`run_updates.py`**: Incremental update mode (hashes API responses to avoid duplicates).
+- **`run_ingest.py`**: Parallelized data ingestion runner.
+
+## Data Loaders (scripts/)
+
+- **`load_alfred.py`**: Real-time vintages from ALFRED. Handles revisions.
+- **`load_fredmd.py`**: Snapshot-based FRED-MD panel ingestion.
+- **`load_eurostat.py`**: Bulk download of Eurostat datasets based on filters.
+- **`load_google_trends.py`**: Ingests Google Trends data with snapshotting.
+- **`load_financials.py`**: Tail-based updates from Yahoo Finance using `yfinance`.
+
+---
+
+## Core Architecture
+
+### Data Preparation (`scripts/data_preparation.py`)
+Automates cleaning, YoY transformation, and stationarity testing (KPSS). It supports:
+- **Common Frequency Mode**: Aggregates all data to a single target frequency (e.g., Monthly).
+- **Mixed Frequency Mode**: Preserves original frequencies for models like MIDAS.
+- **Ragged Edge Handling**: Smart imputation of publication lags at the end of series.
+
+### Backtesting (`nowcasting/evaluation/backtester.py`)
+A strict out-of-sample forward-rolling evaluator. It ensures that only information available at each historical point is used for prediction.
+
+### Models
+Supported architectures include:
+- **Dynamic Factor Models (DFM)**: Standard and Mixed-Frequency implementations via Kalman Filter.
+- **Bayesian VAR (BVAR)**: Frequentist and Bayesian VAR with Minnesota priors.
+- **MIDAS**: Directly regressing low-frequency targets on high-frequency lags.
+- **Bridge Equations**: Two-step mixed-frequency integration.
+- **ML Regressions**: LightGBM and ElasticNet based models.
+- **TACTiS**: Transformer-based multivariate time series model.
+
+---
+
+## Quality & Monitoring
+- **`check_health.py`**: Monitors data staleness, gaps, and data corruption (flatlines).
+- **`scripts/get_vintage.py`**: Utility to extract data state as it existed on a specific historical date.
+- **`check_db.py`**: Diagnostic script to count records and verify ingestion success.
+
