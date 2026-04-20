@@ -819,6 +819,7 @@ Vaidmuo pipeline: Čia originaliu formatu (dažniausiai CSV arba JSON failais)
 (Eurostat, FRED ir t.t.). Tai yra pirminis saugojimas prieš perkeliant viską
 pradine forma į PostgreSQL.
 
+
 Directory: data/processed/
 ------------------------------------
 Paskirtis: Transformuoti ir paruošti analizei duomenys.
