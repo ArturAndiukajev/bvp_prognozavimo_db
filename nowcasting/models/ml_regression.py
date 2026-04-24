@@ -3,13 +3,19 @@ from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMRegressor
+# from lightgbm import LGBMRegressor
 from sklearn.linear_model import ElasticNetCV
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from nowcasting.models.base import BaseNowcastModel
+
+try:
+    from lightgbm import LGBMRegressor
+except:
+    LGBMRegressor = None
+    print("SVARBU: LightGBM nebus pasiekiamas, bet Elastic Net veiks.")
 
 logger = logging.getLogger("nowcast_ml")
 

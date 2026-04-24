@@ -1,22 +1,21 @@
 """
-Mixed-Data Sampling regression where high-frequency predictors are stacked
-into a flat feature vector and regressed on a low-frequency target.
+midas.py — U-MIDAS (Unrestricted MIDAS) nowcast'inimo modelis
+Maišyto dažnio (Mixed-Data Sampling) regresija, kur aukšto dažnio kintamieji
+sumetami į vieną paprastą vektorių ir naudojami žemo dažnio tikslui prognozuoti.
 
-MIDAS intuition
----------------
-Given a quarterly target y_t and monthly predictors x_{t,m} (m=1,2,3 within quarter t):
-  y_t = α + β₁·x_{t,1} + β₂·x_{t,2} + β₃·x_{t,3} + ε_t
+MIDAS esmė
+Jei turim ketvirtinį tikslą y_t ir mėnesinius kintamuosius x_{t,m} (m=1,2,3 to ketvirčio viduje):
+y_t = α + β₁·x_{t,1} + β₂·x_{t,2} + β₃·x_{t,3} + ε_t
 
-The *unrestricted* version (U-MIDAS) places no polynomial constraint on the
-β weights. This is adequate when freq_ratio ≤ 6 (e.g. M→Q=3, W→M≈4).
+„Neapribota“ versija (U-MIDAS) netaiko jokių polinominių apribojimų β svoriams.
+To užtenka, kai dažnių santykis ≤ 6 (pvz., M→Q=3, W→M≈4).
 
 Interface
----------
-X_train : pd.DataFrame with DatetimeIndex at HIGH frequency (e.g. monthly)
-y_train : pd.Series with DatetimeIndex at LOW frequency (e.g. quarterly)
+X_train : pd.DataFrame su DatetimeIndex aukštu dažniu (pvz., mėnesiniu)
+y_train : pd.Series su DatetimeIndex žemu dažniu (pvz., ketvirtiniu)
 
-The model aligns internally and handles ragged right edges (the current
-high-frequency period may be incomplete).
+Modelis pats viską susilygiuoja viduje ir susitvarko su „ištrupėjusiais galais“
+(kai einamasis aukšto dažnio periodas dar nėra užsipildęs iki galo).
 """
 
 from __future__ import annotations
@@ -64,13 +63,23 @@ def _build_midas_features(
     y_values = []
     lf_dates = []
 
-    # Align using the low-freq target dates as the anchor
+    X_hf.index = pd.to_datetime(X_hf.index)
+    y_lf.index = pd.to_datetime(y_lf.index)
+
+    hf_times = pd.to_datetime(X_hf.index).values
+
     for lf_date, lf_val in y_lf.items():
         if pd.isna(lf_val):
             continue
 
-        # Find the high-freq observations up to and including lf_date
-        hf_slice = X_hf.loc[X_hf.index <= lf_date]
+        # Paverčiame tikslo datą į tokį patį formatą
+        target_time = pd.to_datetime(lf_date).to_datetime64()
+
+        # Sukuriame loginę kaukę (mask), kurios pagalba atrenkame eilutes. 
+        # Tai nepriklauso nuo Pandas index tipų!
+        mask = hf_times <= target_time
+        hf_slice = X_hf.iloc[mask]
+
         n_needed = freq_ratio * n_lags
 
         if len(hf_slice) < freq_ratio:  # need at least one full period
@@ -118,8 +127,20 @@ def _build_midas_features_for_predict(
     rows = []
     lf_dates = []
 
+    X_hf.index = pd.to_datetime(X_hf.index)
+    predict_lf_dates = pd.to_datetime(predict_lf_dates)
+
+    hf_times = pd.to_datetime(X_hf.index).values
+
     for lf_date in predict_lf_dates:
-        hf_slice = X_hf.loc[X_hf.index <= lf_date]
+        
+        # Paverčiame tikslo datą į tokį patį formatą
+        target_time = pd.to_datetime(lf_date).to_datetime64()
+
+        # Atrankos kaukė
+        mask = hf_times <= target_time
+        hf_slice = X_hf.iloc[mask]
+
         n_needed = freq_ratio * n_lags
 
         if len(hf_slice) == 0:
@@ -220,13 +241,13 @@ class MIDASNowcast(BaseNowcastModel):
             logger.warning("MIDASNowcast.fit: empty train data, skipping.")
             return self
 
-        # Infer freq_ratio if not provided
-        if self.freq_ratio is None:
+        # Infer freq_ratio if not provided or set to 'auto'
+        if self.freq_ratio is None or str(self.freq_ratio).lower() == "auto":
             self._fitted_freq_ratio = _infer_freq_ratio(
                 pd.DatetimeIndex(X_train.index), pd.DatetimeIndex(y_train.dropna().index)
             )
         else:
-            self._fitted_freq_ratio = self.freq_ratio
+            self._fitted_freq_ratio = int(self.freq_ratio)
 
         logger.info(
             f"MIDASNowcast.fit: freq_ratio={self._fitted_freq_ratio}, "

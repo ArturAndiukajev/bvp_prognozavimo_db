@@ -1,18 +1,15 @@
 """
-Šis modulis skirtas nowcasting modelių vertinimui naudojant rolling arba expanding
-backtesting strategijas,užtikrinant, kad nebūtų duomenų nutekėjimo
-(data leakage). Visi modeliai yra treniruojami tik naudojant treniravimo lango
-duomenis.
+backtester.py — Slenkančio / besiplečiančio backtest'o įrankis
+Testuoja nowcast'inimo modelius naudojant slenkantį arba besiplečiantį laiko langą.
+Griežtai prižiūri, kad nebūtų duomenų nutekėjimo (visi modeliai ir
+transformacijos mokomi tik ant train lango).
 
-Pagrindinės funkcijos:
-Backtesting su expanding arba rolling langais
-Du režimai:
-common_frequency  – kai X ir y turi tą pačią laiko struktūrą
-mixed_frequency   – kai X yra aukšto dažnio, o y – žemo dažnio
+Palaiko:
 
-Automatinis X ir y indeksų suderinimas
-Transformer ir feature selection pipeline palaikymas
-Modelio prognozių standartizavimas į vieningą formatą
+common_frequency: kai X ir y dažniai bei indeksai sutampa.
+
+mixed_frequency: skirta bridge tipo modeliams, kur X yra aukšto dažnio,
+o y – žemo. Sukasi per matomas tikslo datas.
 """
 
 from __future__ import annotations
@@ -30,6 +27,7 @@ logger = logging.getLogger("nowcast_backtest")
 class RollingBacktester:
     """
     Backtester for nowcasting models.
+
     Parameters
     ----------
     initial_train_periods : int
@@ -354,7 +352,7 @@ class RollingBacktester:
 
             # For mixed-frequency bridge workflows, supervised external selectors
             # often do not apply cleanly because HF X and LF y differ in length.
-            #Therefore try y-aware fit only when lengths match; otherwise we
+            # We therefore try y-aware fit only when lengths match; otherwise we
             # fall back to unsupervised fit(X). If that fails, the step is skipped.
             if transformer is not None:
                 X_train, X_test, n_trans_features = self._apply_step(
@@ -404,6 +402,8 @@ class RollingBacktester:
                         step_callback(running_rmse, step=n_steps_run)
                         
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 logger.error(
                     f"MF step failed | {model.__class__.__name__}: {e} | "
                     f"X_train={X_train.shape}, X_test={X_test.shape}, "
@@ -444,7 +444,15 @@ class RollingBacktester:
             fitted = clone(step)
 
             # y-aware fit only when lengths match
-            if y_train is not None and len(y_train) == len(X_train):
+            # if y_train is not None and len(y_train) == len(X_train):
+            #     try:
+            #         fitted.fit(X_train, y_train)
+            #     except TypeError:
+            #         fitted.fit(X_train)
+            # else:
+            #     fitted.fit(X_train)
+            # ALWAYS try y-aware fit if y_train exists!
+            if y_train is not None:
                 try:
                     fitted.fit(X_train, y_train)
                 except TypeError:

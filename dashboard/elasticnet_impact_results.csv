@@ -1,0 +1,4 @@
+Variable,Series_Key,Name,Coefficient,Abs_Impact
+248702087,NAMQ_10_GDP.freq=Q.unit=CLV_I10.s_adj=SCA.na_item=P41.geo\TIME_PERIOD=LT,Gross domestic product  and main components,0.003897188102120083,0.003897188102120083
+248702882,NAMQ_10_GDP.freq=Q.unit=CLV_I10.s_adj=SCA.na_item=P3_P6.geo\TIME_PERIOD=LT,Gross domestic product  and main components,0.002252307730925723,0.002252307730925723
+248698819,NAMQ_10_A10.freq=Q.unit=CLV_I10.s_adj=SCA.nace_r2=B-E.na_item=B1G.geo\TIME_PERIOD=LT,Gross value added and income by main industry,0.00017469039286262817,0.00017469039286262817

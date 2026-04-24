@@ -1,4 +1,7 @@
 """
+run_midas_search.py  —  MIDAS / U-MIDAS Grid-Search Experiment Pipeline
+========================================================================
+
 Systematic search over:
   - Feature selection / compression methods
   - MIDAS hyperparameters  (n_lags, freq_ratio, lf_freq, fill_strategy)
@@ -141,6 +144,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Data
+    # Backtest settings
+    ap.add_argument("--limit-features", type=int, default=0,
+                    help="Limit the number of input features for quick smoke testing (0 = no limit)")
     ap.add_argument("--data-dir", default=_DEFAULT_DATA_DIR,
                     help="Directory containing processed parquet files")
     ap.add_argument("--input-panel", default=None,
@@ -226,6 +232,80 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Path for the detailed results CSV")
 
     return ap
+
+
+
+def optuna_objective(trial, X_panel, y_target, args, tracker):
+    selector_name = trial.suggest_categorical("selector", ["none", "pca", "corr_top_n"])
+    selector_params = {}
+    if selector_name == "pca":
+        selector_params["n_components"] = trial.suggest_int("pca_comp", 2, 10)
+    elif selector_name == "corr_top_n":
+        selector_params["top_n"] = trial.suggest_int("corr_top_n_k", 5, 30)
+
+    n_lags = trial.suggest_int("n_lags", 1, 4) 
+    
+    l1_ratio = trial.suggest_float("enet_l1_ratio", 0.1, 0.9)
+    
+    train_window = trial.suggest_categorical("train_window", [40, 60, 80])
+
+    config = {
+        "model": "elasticnet",
+        "selector_method": selector_name,
+        "selector_params": selector_params,
+        "model_params": {
+            "l1_ratio": l1_ratio,
+            "n_lags": n_lags,
+            "fill_strategy": "zero"
+        },
+        "train_window": train_window,
+        "step_size": 1
+    }
+    
+    res = run_single_experiment(config, X_panel, y_target, args.search_last_n_steps, args.seed)
+    
+    if res.get("status") != "success":
+        raise optuna.TrialPruned()
+        
+    return res.get("rmse")
+
+def run_optuna_engine(X_panel: pd.DataFrame, y_target: pd.Series, args: argparse.Namespace, out_dir: Path, suffix: str):
+    logger.info("Starting OPTUNA engine.")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    study_name = args.study_name or f"midas_{suffix}"
+    storage_url = args.study_storage or f"sqlite:///{out_dir.absolute()}/midas_optuna.db"
+
+    sampler = optuna.samplers.TPESampler(seed=args.seed)
+
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage_url,
+        direction="minimize",
+        load_if_exists=True,
+        sampler=sampler,
+    )
+
+    tracker = OptunaBestTracker(out_dir, suffix)
+
+    if len(study.trials) > 0:
+        logger.info(f"Resuming study '{study_name}' with {len(study.trials)} existing trials.")
+        try:
+            tracker.best_rmse = study.best_value
+        except ValueError:
+            pass
+
+    out_csv = out_dir / f"optuna_trials_{suffix}.csv"
+    
+    # Pridėkite optimizavimo paleidimą, kad funkcija nebūtų tuščia
+    study.optimize(
+        lambda t: optuna_objective(t, X_panel, y_target, args, tracker),
+        n_trials=args.n_trials,
+        n_jobs=args.n_jobs
+    )
+    
+    logger.info(f"Best RMSE: {study.best_value:.5f}")
+
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +473,9 @@ def run_single_experiment(
         init_train = config["train_window"]
         step_sz    = config["step_size"]
         if search_last_n_steps > 0:
-            required_start = len(y_target) - search_last_n_steps
+            # Skaičiuojame tik užpildytas BVP reikšmes (ketvirčius), o ne mėnesius
+            observed_quarters = y_target.notna().sum() 
+            required_start = observed_quarters - search_last_n_steps
             init_train = max(init_train, required_start)
 
         bt = RollingBacktester(
@@ -489,7 +571,8 @@ def optuna_objective(
     args: argparse.Namespace, 
     tracker: OptunaBestTracker
 ) -> float:
-    selector_name = trial.suggest_categorical("selector", ["none", "corr_top_n", "fast_screen", "variance_filter", "lasso", "elasticnet", "pca", "factor_analysis"])
+    # selector_name = trial.suggest_categorical("selector", ["none", "corr_top_n", "fast_screen", "variance_filter", "lasso", "elasticnet", "pca", "factor_analysis"])
+    selector_name = trial.suggest_categorical("selector", ["none"])
     selector_params = {}
     
     if selector_name == "variance_filter":
@@ -512,9 +595,8 @@ def optuna_objective(
     reg_params = {}
     
     if reg_model in ("ridge", "lasso"):
-        reg_params["alpha"] = trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True)
+        pass 
     elif reg_model == "elasticnet":
-        reg_params["alpha"] = trial.suggest_float("reg_enet_alpha", 1e-4, 10.0, log=True)
         reg_params["l1_ratio"] = trial.suggest_float("reg_enet_l1", 0.1, 0.9)
 
     n_lags = trial.suggest_int("n_lags", 1, 12)
@@ -735,7 +817,19 @@ def main() -> None:
     # 1. Load data
     data_dir = Path(args.data_dir)
     logger.info("Loading panel ...")
+    
     X_panel, y_target = load_cf_panel(data_dir, args.target, panel_arg=args.input_panel)
+    
+    X_panel.index = pd.to_datetime(X_panel.index)
+    y_target.index = pd.to_datetime(y_target.index)
+    
+    X_panel.columns = X_panel.columns.astype(str)
+    y_target.name = str(y_target.name)
+    # --- ADD THIS BLOCK FOR SMOKE TESTING ---
+    if args.limit_features > 0 and X_panel.shape[1] > args.limit_features:
+        logger.info(f"Smoke test mode: Truncating features from {X_panel.shape[1]} to {args.limit_features}")
+        X_panel = X_panel.iloc[:, :args.limit_features]
+    # ----------------------------------------
     logger.info(f"Panel shape: {X_panel.shape}  |  Target: {y_target.name}")
 
     # Detect panel path for output naming
@@ -764,6 +858,7 @@ def main() -> None:
         run_evaluation_engine(X_panel, y_target, args, out_path.parent, suffix_base)
         return
 
+    # Fallback to standard grid/staged below...
     grid = generate_grid(args)
     logger.info(f"Generated {len(grid)} experiment configurations.")
     if not grid:

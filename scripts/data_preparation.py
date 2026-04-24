@@ -1,27 +1,25 @@
 """
-Dviejų režimų duomenų paruošimo pipeline makroekonominiam nowcastinimui.
+data_preparation.py
+Dviejų režimų duomenų paruošimas makro dabarčiai prognozuoti (nowcasting'ui).
 
 Režimai
--------
-common_frequency  — agreguoja visas laiko eilutes į vieną dažnį (numatytasis: mėnesinis)
-                    ir taiko pilną stacionarumo pipeline'ą (KPSS/ADF + diferencijavimas).
-mixed_frequency   — išsaugo pradinius dažnius (D, W, M, Q).
-                    Taiko lengvesnes stacionarumo transformacijas, tinkamas MIDAS,
-                    Bridge Equation ir mišraus dažnio DFM modeliams.
+common_frequency  — visus duomenis suvedam į vieną dažnį (dažniausiai mėnesinį)
+ir praleidžiam per pilną stacionarumo filtrą (KPSS/ADF + skirtumai).
+mixed_frequency   — paliekam originalius dažnius (D, W, M, Q).
+Taikom lengvesnes stacionarumo transformacijas, tinkamas MIDAS /
+Bridge Equation / maišyto dažnio DFM modeliams.
 
 Naudojimo pavyzdžiai
---------------------
-#Bendro dažnio (mėnesinis) pipeline, visi duomenų šaltiniai
+Bendras dažnis (mėnesinis), per visus tiekėjus
 python scripts/data_preparation.py --mode common_frequency
-#Mišraus dažnio pipeline, apribotas iki 100 eilučių greitam testui
-python scripts/data_preparation.py --mode mixed_frequency --limit-series 100
-#Bendro dažnio pipeline su pasirinktiniais nustatymais
-python scripts/data_preparation.py --mode common_frequency --min-obs 48 --kpss-alpha 0.10
 
-Realizuota chechpointų sistema, kuri padeda išvengti laiko praradimo dirbant su dideliais
-duomenų kiekiais. Be to galima duomenis padalinti į chunkus. Taip pat, patogumo dėlei,
-failai vadinami pagal parinktus parametrus.
+Maišytas dažnis, tik 100 eilučių greitam testui
+python scripts/data_preparation.py --mode mixed_frequency --limit-series 100
+
+Bendras dažnis su savais nustatymais
+python scripts/data_preparation.py --mode common_frequency --min-obs 48 --kpss-alpha 0.10
 """
+
 from __future__ import annotations
 
 import os
@@ -35,7 +33,7 @@ import gc
 import shutil
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List, Any
@@ -185,6 +183,7 @@ class PrepConfig:
 # ---------------------------------------------------------------------------
 # Statistical helpers
 # ---------------------------------------------------------------------------
+
 def kpss_pvalue(x: pd.Series, regression: str = "c") -> Optional[float]:
     """KPSS p-value. Returns None if series is too short or test fails."""
     x = x.dropna()
@@ -303,6 +302,7 @@ def detect_seasonality(s: pd.Series, series_meta: pd.Series, cfg: PrepConfig) ->
     is_seasonal_stat = False
     acf_val = 0.0
 
+    # --> YOUR GENIUS LOGIC: Only run math if metadata is unknown! <--
     if mode != "metadata_only" and not is_sa_meta and not is_nsa_meta:
         freq = str(series_meta.get("frequency", "")).upper()
         lag = 12 if "M" in freq else (4 if "Q" in freq else None)
@@ -323,7 +323,7 @@ def detect_seasonality(s: pd.Series, series_meta: pd.Series, cfg: PrepConfig) ->
                 except Exception:
                     pass
 
-   #Decision Logic
+    # 3. Decision Logic
     if is_nsa_meta or is_seasonal_stat:
         status = "seasonal"
         reason = "nsa_metadata" if is_nsa_meta else f"acf_lag_{lag if 'lag' in locals() and lag else 'N/A'}_stat"
@@ -486,7 +486,7 @@ def monthly_resample(s: pd.Series, freq: str, daily_weekly_rule: str = "mean") -
     elif freq in ("M", "ME", "MS"):
         return s.resample("ME").last()
     elif freq in ("Q", "QE", "QS"):
-        #keep quarter-end month only (NaN for in-between months)
+        # Quarterly → keep quarter-end month only (NaN for in-between months)
         return s.resample("Q").last().resample("ME").asfreq()
     else:
         return s.resample("ME").mean()
@@ -573,7 +573,7 @@ def fetch_metadata(
 
     where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     
-    #Apply limit_series at the very end to guarantee it limits within the correctly selected scope
+    # We apply limit_series at the very end to guarantee it limits within the correctly selected scope
     limit_sql = "LIMIT :limit_series" if limit_series else ""
     if limit_series:
         params["limit_series"] = limit_series
@@ -609,6 +609,14 @@ def fetch_obs_chunk(chunk_sids: List[int], min_date: str) -> pd.DataFrame:
     """)
     chunk_params = {"chunk_ids": chunk_sids, "min_date": min_date}
     return safe_read_sql(obs_sql, engine, params=chunk_params)
+
+
+
+
+
+# (Legacy intermediate panel builders removed in favor of streaming)
+
+
 # ---------------------------------------------------------------------------
 # Stationarity Pipeline — Common-Frequency Mode
 # ---------------------------------------------------------------------------
@@ -620,12 +628,15 @@ def apply_transform_and_diff(s: pd.Series, transform_applied: str, diffs_used: i
         z = yoy_transform(s, periods=periods)
     else:
         z = safe_log(s).diff(1)
+        
     if diffs_used > 0:
         z = z.diff(diffs_used)
+        
     return z
 
+
 def _process_cf_series(args: Tuple) -> Tuple[int, pd.Series, Dict]:
-    """Worker: resamples + transforms + stationarity filter for one series."""
+    """Worker: resamples + transforms + stationarity filter for one series (CF mode)."""
     sid, vals, dates, series_meta, cfg, cache_dict = args
     s = pd.Series(vals, index=pd.DatetimeIndex(dates)).sort_index()
     freq = str(series_meta.get("frequency", ""))
@@ -649,7 +660,7 @@ def _process_cf_series(args: Tuple) -> Tuple[int, pd.Series, Dict]:
         "final_non_nan": 0,
     }
 
-    # 1.Span Check
+    # 1. Span Check
     if diag["span_years"] < cfg.min_span_years:
         diag["dropped_reason"] = f"too_short_span_{diag['span_years']:.1f}<{cfg.min_span_years}"
         return sid, x, diag
@@ -668,6 +679,7 @@ def _process_cf_series(args: Tuple) -> Tuple[int, pd.Series, Dict]:
 
     # Check if we have a valid cache hit (data hasn't grown by more than 10%)
     if sid_str in cache_dict and current_count <= cache_dict[sid_str].get("obs_count", 0) * 1.1:
+        # CACHE HIT: Skip heavy stats and use known signature
         cached = cache_dict[sid_str]
         diag["is_seasonal"] = cached["is_seasonal"]
         diag["is_sa"] = cached["is_sa"]
@@ -676,6 +688,7 @@ def _process_cf_series(args: Tuple) -> Tuple[int, pd.Series, Dict]:
         diag["diffs_used"] = cached["diffs_used"]
 
     else:
+        # CACHE MISS: Run expensive tests
         # 3. Seasonality Detection
         s_diag = detect_seasonality(x_imputed, series_meta, cfg)
         diag["is_seasonal"] = s_diag["is_seasonal"]
@@ -711,7 +724,9 @@ def _process_cf_series(args: Tuple) -> Tuple[int, pd.Series, Dict]:
     # Unified Transformation & Differencing Application
     final = apply_transform_and_diff(x_imputed, diag["transform_applied"], diag["diffs_used"])
 
-    #Protect models from extreme shocks (like COVID)
+    
+
+    # --> ADD THIS LINE: Protect models from extreme shocks (like COVID)
     final = winsorize_series(final, limits=(0.01, 0.01))
 
     # 6. Ragged edges
@@ -744,12 +759,18 @@ def _process_cf_series(args: Tuple) -> Tuple[int, pd.Series, Dict]:
         return sid, final, compact_diag
 
     return sid, final, diag
+
+
+# ---------------------------------------------------------------------------
+# Stationarity Pipeline — Mixed-Frequency Mode
 # ---------------------------------------------------------------------------
 # Stationarity Pipeline — Mixed-Frequency Mode
 # ---------------------------------------------------------------------------
 
 def _process_mf_series(args: Tuple) -> Tuple[int, pd.Series, Dict]:
-    """Lighter transforms for one series."""
+    """
+    Worker: lighter transforms for one series (MF mode).
+    """
     sid, vals, dates, series_meta, cfg, canon_freq, cache_dict = args
     s = pd.Series(vals, index=pd.DatetimeIndex(dates)).sort_index()
 
@@ -803,6 +824,7 @@ def _process_mf_series(args: Tuple) -> Tuple[int, pd.Series, Dict]:
     current_count = diag["initial_non_nan"]
 
     if sid_str in cache_dict and current_count <= cache_dict[sid_str].get("obs_count", 0) * 1.1:
+        # CACHE HIT
         cached = cache_dict[sid_str]
         diag["is_seasonal"] = cached["is_seasonal"]
         diag["is_sa"] = cached["is_sa"]
@@ -811,13 +833,14 @@ def _process_mf_series(args: Tuple) -> Tuple[int, pd.Series, Dict]:
         diag["diffs_used"] = cached["diffs_used"]
 
     else:
+        # CACHE MISS
         # 3. Seasonality Detection
         s_diag = detect_seasonality(x_imputed, series_meta, cfg)
         diag["is_seasonal"] = s_diag["is_seasonal"]
         diag["is_sa"] = s_diag["is_sa"]
         diag["detect_reason"] = s_diag["reason"]
 
-        # 4. Adaptive Transformation
+        # 4. Adaptive Transformation (MF mode)
         if diag["is_seasonal"]:
             freq_str = str(diag["frequency"]).upper()
             if "M" in freq_str: periods = 12
@@ -894,8 +917,10 @@ def _run_parallel(
     chunk_idx: int = 1,
     total_chunks: int = 1
 ) -> Tuple[Dict[int, pd.Series], List[Dict]]:
-    """Run worker_fn over args_list using ThreadPoolExecutor
-    or ProcessPoolExecutor when cfg.use_multiprocess=True."""
+    """
+    Run worker_fn over args_list using ThreadPoolExecutor (Windows-safe default)
+    or ProcessPoolExecutor when cfg.use_multiprocess=True.
+    """
     total = len(args_list)
     out_valid: Dict[int, pd.Series] = {}
     report_rows: List[Dict] = []
@@ -911,6 +936,7 @@ def _run_parallel(
         futures = {executor.submit(worker_fn, arg): arg[0] for arg in args_list}
         for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
             if _INTERRUPT_REQUESTED:
+                # Let pool finish naturally but don't log normal progress to not spam
                 pass
 
             try:
@@ -938,6 +964,27 @@ def _run_parallel(
                 )
 
     return out_valid, report_rows
+
+
+# def prepare_panel_cf_chunk(
+#     df_chunk: pd.DataFrame, meta: pd.DataFrame, cfg: PrepConfig,
+#     chk: CheckpointManager, chunk_idx: int, total_chunks: int
+# ) -> List[Dict]:
+#     report_rows = []
+#     if df_chunk.empty:
+#         chk.mark_chunk_completed(chunk_idx)
+#         return report_rows
+
+#     groups = list(df_chunk.groupby("series_id"))
+#     args_list = []
+#     for sid, group in groups:
+#         vals = group["value"].values
+#         dates = group["period_date"].values 
+#         series_meta = meta.loc[sid] if sid in meta.index else pd.Series()
+#         args_list.append((sid, vals, dates, series_meta, cfg))
+
+#     out_valid, chunk_report_rows = _run_parallel(args_list, _process_cf_series, cfg, "CF", chunk_idx, total_chunks)
+
 
 def prepare_panel_cf_chunk(
     df_chunk: pd.DataFrame, meta: pd.DataFrame, cfg: PrepConfig,
@@ -989,6 +1036,26 @@ def _canonical_mf_freq(freq: str) -> str:
             return canon
     return "M"  # default to monthly if unknown
 
+
+# def prepare_panel_mf_chunk(
+#     df_chunk: pd.DataFrame, meta: pd.DataFrame, cfg: PrepConfig,
+#     chk: CheckpointManager, chunk_idx: int, total_chunks: int
+# ) -> List[Dict]:
+#     report_rows = []
+#     if df_chunk.empty:
+#         chk.mark_chunk_completed(chunk_idx)
+#         return report_rows
+
+#     groups = list(df_chunk.groupby("series_id"))
+#     args_list = []
+#     for sid, group in groups:
+#         vals = group["value"].values
+#         dates = group["period_date"].values
+#         series_meta = meta.loc[sid] if sid in meta.index else pd.Series()
+#         raw_freq = str(series_meta.get("frequency", ""))
+#         canon = _canonical_mf_freq(raw_freq)
+#         args_list.append((sid, vals, dates, series_meta, cfg, canon))
+
 def prepare_panel_mf_chunk(
     df_chunk: pd.DataFrame, meta: pd.DataFrame, cfg: PrepConfig,
     chk: CheckpointManager, chunk_idx: int, total_chunks: int,
@@ -1008,6 +1075,8 @@ def prepare_panel_mf_chunk(
         raw_freq = str(series_meta.get("frequency", ""))
         canon = _canonical_mf_freq(raw_freq)
         args_list.append((sid, vals, dates, series_meta, cfg, canon, stationarity_cache))
+
+    # Run workers
 
     out_valid, chunk_report_rows = _run_parallel(args_list, _process_mf_series, cfg, "MF", chunk_idx, total_chunks)
     report_rows.extend(chunk_report_rows)
@@ -1235,6 +1304,10 @@ def aggregate_chunk_reports(checkpoint_dir: Path) -> List[Dict]:
             logger.warning(f"Could not read chunk report {f}: {e}")
     return all_rows
 
+
+
+
+
 # ---------------------------------------------------------------------------
 # Main Execution
 # ---------------------------------------------------------------------------
@@ -1290,10 +1363,12 @@ def main() -> None:
     ap.add_argument("--use-multiprocess", action="store_true",
                     help="Use ProcessPoolExecutor instead of ThreadPoolExecutor (better on Linux/macOS)")
 
+    # --- NEW: Scalability & Checkpointing ---
     ap.add_argument("--chunk-size", type=int, default=500, help="Number of series per processing chunk")
     ap.add_argument("--resume-from-checkpoint", action="store_true", help="Resume from last interrupted run checkpoints")
     ap.add_argument("--debug", action="store_true", help="Print verbose worker tracebacks")
 
+    # --- NEW: Pseudo Real-Time Time Machine ---
     ap.add_argument("--cutoff-date", type=str, default=None,
                     help="Simulate a specific date in history to prevent data leakage (YYYY-MM-DD)")
 
@@ -1431,6 +1506,7 @@ def main() -> None:
             chk.mark_chunk_completed(chunk_idx)
             continue
 
+        # 2d. Cutoff / Time Machine Filter
         if args.cutoff_date:
             cutoff = pd.to_datetime(args.cutoff_date)
             is_q = df_chunk['frequency'].str.contains('Q', case=False, na=False)
@@ -1458,7 +1534,7 @@ def main() -> None:
                 freq_val = meta.loc[int(sid)]["frequency"] if int(sid) in meta.index else "?"
                 chunk_diagnostics[int(sid)]["dropped_reason"] = f"prefilter_disallowed_freq_{freq_val}"
 
-        # 2f.Filtering
+        # 2f. Heuristic Filtering
         if not df_chunk.empty:
             obs_stats = df_chunk.dropna(subset=["value"]).groupby("series_id", observed=True)
             v_counts = obs_stats.size()
