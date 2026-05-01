@@ -1,0 +1,23 @@
+{
+    "dfm_factor_order": 2,
+    "dfm_k_factors": 3,
+    "mae": 0.011016989649699542,
+    "mixed_frequency": false,
+    "n_eval_points": 282,
+    "n_folds": 282,
+    "n_model_used_vars": 50,
+    "n_raw_features": 287,
+    "n_sel_features": 50,
+    "n_trans_features": 287,
+    "rmse": 0.013180985239876396,
+    "runtime_sec": 102089.4,
+    "scale_x": true,
+    "selector_method": "corr_top_n",
+    "selector_params": {
+        "top_n": 50
+    },
+    "status": "success",
+    "step_size": 1,
+    "train_window": 30,
+    "window_type": "expanding"
+}

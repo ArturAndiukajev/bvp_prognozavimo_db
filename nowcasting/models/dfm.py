@@ -21,6 +21,15 @@ from nowcasting.models.base import BaseNowcastModel
 logger = logging.getLogger("nowcast_dfm")
 
 
+def _safe_freq(new_alias: str, old_alias: str) -> str:
+    try:
+        import pandas as pd
+        pd.date_range("2000-01-01", periods=2, freq=new_alias)
+        return new_alias
+    except Exception:
+        return old_alias
+
+
 class DynamicFactorNowcast(BaseNowcastModel):
     """
     Dynamic Factor Model wrapper.
@@ -56,6 +65,9 @@ class DynamicFactorNowcast(BaseNowcastModel):
         self.factor_order = factor_order
         self.mixed_frequency = mixed_frequency
         self.quarterly_cols = quarterly_cols or []
+        self.maxiter = kwargs.get("maxiter", 50)
+        self.tolerance = kwargs.get("tolerance", 1e-5)
+        self.allow_unconditional_fallback = kwargs.get("allow_unconditional_fallback", False)
         self.fitted_res_ = None
 
     # ------------------------------------------------------------------
@@ -124,8 +136,19 @@ class DynamicFactorNowcast(BaseNowcastModel):
             f"{self.k_factors} factors..."
         )
 
-        endog_m = endog[m_cols] if m_cols else endog
-        endog_q = endog[q_cols] if q_cols else None
+        m_freq = _safe_freq("ME", "M")
+        q_freq = _safe_freq("QE", "Q")
+
+        endog_m = endog[m_cols].copy() if m_cols else None
+        endog_q = endog[q_cols].copy() if q_cols else None
+
+        if endog_m is not None:
+            endog_m = endog_m.asfreq(m_freq)
+
+        if endog_q is not None:
+            # DynamicFactorMQ expects quarterly columns to actually have a quarterly frequency index
+            endog_q = endog_q.resample(q_freq).last()
+            endog_q = endog_q.dropna(how="all")
 
         try:
             model = DynamicFactorMQ(
@@ -137,12 +160,13 @@ class DynamicFactorNowcast(BaseNowcastModel):
             )
             self.fitted_res_ = model.fit(
                 disp=False,
-                maxiter=200,
+                maxiter=self.maxiter,
+                tolerance=self.tolerance,
                 method="em",
             )
         except Exception as e:
-            logger.error(f"[DFM-MF] DynamicFactorMQ failed: {e}. Falling back to CF-DFM.")
-            self._fit_standard(endog)
+            logger.error(f"[DFM-MF] DynamicFactorMQ failed: {e}.")
+            raise e
 
     # ------------------------------------------------------------------
     def predict(self, X_test: pd.DataFrame) -> pd.Series:
@@ -172,7 +196,12 @@ class DynamicFactorNowcast(BaseNowcastModel):
             predictions = extended_res.fittedvalues[self.target_col].iloc[-len(X_test):]
             return pd.Series(predictions.values, index=X_test.index, name=f"{self.target_col}_pred")
         except Exception as e:
-            logger.error(f"[DFM-CF] predict append failed: {e}. Falling back to unconditional forecast.")
+            msg = f"[DFM-CF] predict append failed: {e}."
+            if not self.allow_unconditional_fallback:
+                logger.error(msg + " Unconditional fallback is disabled.")
+                raise e
+            
+            logger.warning(msg + " Falling back to unconditional forecast.")
             try:
                 forecast = self.fitted_res_.forecast(steps=len(X_test))
                 if isinstance(forecast, pd.DataFrame):
@@ -198,11 +227,21 @@ class DynamicFactorNowcast(BaseNowcastModel):
         try:
             # TRUE CONDITIONAL NOWCASTING for Mixed Frequency
             # We specify which columns are monthly vs quarterly, identically to how it was fit.
+            m_freq = _safe_freq("ME", "M")
+            q_freq = _safe_freq("QE", "Q")
+
             q_cols = [c for c in self.quarterly_cols if c in test_endog.columns]
             m_cols = [c for c in test_endog.columns if c not in q_cols]
             
-            test_endog_m = test_endog[m_cols] if m_cols else test_endog
-            test_endog_q = test_endog[q_cols] if q_cols else None
+            test_endog_m = test_endog[m_cols].copy() if m_cols else None
+            test_endog_q = test_endog[q_cols].copy() if q_cols else None
+
+            if test_endog_m is not None and not test_endog_m.empty:
+                test_endog_m = test_endog_m.asfreq(m_freq)
+
+            if test_endog_q is not None and not test_endog_q.empty:
+                test_endog_q = test_endog_q.resample(q_freq).last()
+                test_endog_q = test_endog_q.dropna(how="all")
             
             # append allows extending the state with new test obs
             extended_res = self.fitted_res_.append(
@@ -210,12 +249,18 @@ class DynamicFactorNowcast(BaseNowcastModel):
                 endog_quarterly=test_endog_q,
                 refit=False
             )
-            
-            predictions = extended_res.fittedvalues[self.target_col].iloc[-len(X_test):]
-            return pd.Series(predictions.values, index=X_test.index, name=f"{self.target_col}_pred")
-            
+
+            predictions = extended_res.fittedvalues[self.target_col]
+            # Return the tail corresponding to X_test
+            # Note: For quarterly targets in a monthly model, this series will have NaNs for non-quarter-end months.
+            return predictions.iloc[-len(X_test):]
         except Exception as e:
-            logger.warning(f"[DFM-MF] predict append failed: {e}. Falling back to unconditional forecast.")
+            msg = f"[DFM-MF] predict append failed: {e}."
+            if not self.allow_unconditional_fallback:
+                logger.error(msg + " Unconditional fallback is disabled.")
+                raise e
+
+            logger.warning(msg + " Falling back to unconditional forecast.")
             try:
                 n_steps = len(X_test)
                 forecast = self.fitted_res_.forecast(steps=n_steps)

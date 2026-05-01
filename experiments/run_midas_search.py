@@ -235,6 +235,25 @@ def build_parser() -> argparse.ArgumentParser:
 def _parse_list(s: str, dtype=str) -> list:
     return [dtype(v.strip()) for v in s.split(",") if v.strip()]
 
+def filter_feasible_train_windows(train_windows: List[int], n_total: int, min_test_steps: int = 5) -> List[int]:
+    """Filters train windows that are too large for the dataset."""
+    max_allowed = n_total - min_test_steps
+    feasible = [tw for tw in train_windows if tw < max_allowed]
+    
+    if not feasible:
+        # Fallback: generate windows as fractions of dataset length
+        if n_total > 15:
+            fallback = [int(n_total * 0.3), int(n_total * 0.5), int(n_total * 0.7)]
+        else:
+            fallback = [max(5, n_total - min_test_steps - 1)]
+        feasible = sorted(list(set(fallback)))
+        logger.info(f"Small dataset (n={n_total}): all requested windows were too large. Falling back to {feasible}")
+    else:
+        if len(feasible) < len(train_windows):
+            logger.info(f"Small dataset (n={n_total}): restricted train_windows to {feasible} from original set.")
+            
+    return feasible
+
 
 def _selector_param_grid(method: str, args: argparse.Namespace) -> List[dict]:
     """Return the list of selector parameter dicts for a given method."""
@@ -304,7 +323,7 @@ def generate_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
     fill_strategies  = _parse_list(args.fill_strategies, str)
     regression_models = _parse_list(args.regression_models, str)
     l1_ratios         = _parse_list(args.regression_l1_ratios, float)
-    train_windows     = _parse_list(args.train_windows, int)
+    train_windows     = getattr(args, "feasible_train_windows", _parse_list(args.train_windows, int))
     step_sizes        = _parse_list(args.step_sizes, int)
     lf_freq           = args.lf_freq.strip()
 
@@ -519,7 +538,10 @@ def optuna_objective(
 
     n_lags = trial.suggest_int("n_lags", 1, 12)
     fill_strategy = trial.suggest_categorical("fill_strategy", ["zero", "ffill_then_zero", "mean"])
-    train_window = trial.suggest_categorical("train_window", [60, 80, 100, 120])
+    
+    # Use the pre-filtered windows from args if available, otherwise fallback to defaults
+    tw_candidates = getattr(args, "feasible_train_windows", [60, 80, 100, 120])
+    train_window = trial.suggest_categorical("train_window", tw_candidates)
     step_size = trial.suggest_categorical("step_size", [1, 3])
 
     freq_choices = [v.strip() for v in str(args.freq_ratios).split(",") if v.strip()]
@@ -737,6 +759,10 @@ def main() -> None:
     logger.info("Loading panel ...")
     X_panel, y_target = load_cf_panel(data_dir, args.target, panel_arg=args.input_panel)
     logger.info(f"Panel shape: {X_panel.shape}  |  Target: {y_target.name}")
+
+    # 1.5 Filter feasible windows
+    requested_windows = _parse_list(args.train_windows, int)
+    args.feasible_train_windows = filter_feasible_train_windows(requested_windows, len(y_target))
 
     # Detect panel path for output naming
     if args.input_panel:

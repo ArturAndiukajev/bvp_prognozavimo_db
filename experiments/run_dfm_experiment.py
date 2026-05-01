@@ -184,6 +184,25 @@ def build_experiment_parser() -> argparse.ArgumentParser:
 def parse_list(val_str: str, dtype=int):
     return [dtype(v.strip()) for v in val_str.split(",") if v.strip()]
 
+def filter_feasible_train_windows(train_windows: List[int], n_total: int, min_test_steps: int = 5) -> List[int]:
+    """Filters train windows that are too large for the dataset."""
+    max_allowed = n_total - min_test_steps
+    feasible = [tw for tw in train_windows if tw < max_allowed]
+    
+    if not feasible:
+        # Fallback: generate windows as fractions of dataset length
+        if n_total > 15:
+            fallback = [int(n_total * 0.3), int(n_total * 0.5), int(n_total * 0.7)]
+        else:
+            fallback = [max(5, n_total - min_test_steps - 1)]
+        feasible = sorted(list(set(fallback)))
+        logger.info(f"Small dataset (n={n_total}): all requested windows were too large. Falling back to {feasible}")
+    else:
+        if len(feasible) < len(train_windows):
+            logger.info(f"Small dataset (n={n_total}): restricted train_windows to {feasible} from original set.")
+            
+    return feasible
+
 def build_selector(method: str, params: dict):
     if method == "none":
         return IdentitySelector()
@@ -325,7 +344,8 @@ def optuna_objective(
     args: argparse.Namespace, 
     tracker: OptunaBestTracker
 ) -> float:
-    selector_name = trial.suggest_categorical("selector", ["none", "corr_top_n", "fast_screen", "lasso", "elasticnet", "pca", "factor_analysis", "autoencoder"])
+    selector_candidates = [s.strip() for s in args.selectors.split(",") if s.strip()]
+    selector_name = trial.suggest_categorical("selector", selector_candidates)
     selector_params = {}
     
     if selector_name == "corr_top_n":
@@ -347,7 +367,9 @@ def optuna_objective(
     dfm_k_factors = trial.suggest_int("dfm_k_factors", 1, 4)
     dfm_factor_order = trial.suggest_int("dfm_factor_order", 1, 3)
 
-    train_window = trial.suggest_categorical("train_window", [60, 80, 100, 120])
+    # Use the pre-filtered windows from args if available, otherwise fallback to defaults
+    tw_candidates = getattr(args, "feasible_train_windows", [60, 80, 100, 120])
+    train_window = trial.suggest_categorical("train_window", tw_candidates)
     step_size = trial.suggest_categorical("step_size", [1, 3])
     window_type = trial.suggest_categorical("window_type", ["expanding", "rolling"])
     
@@ -542,7 +564,7 @@ def generate_experiment_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
     
     k_factors = parse_list(args.dfm_k_factors, int)
     factor_orders = parse_list(args.dfm_factor_orders, int)
-    train_windows = parse_list(args.train_windows, int)
+    train_windows = getattr(args, "feasible_train_windows", parse_list(args.train_windows, int))
     step_sizes = parse_list(args.step_sizes, int)
     window_types = [w.strip() for w in args.window_type.split(",")]
     rolling_window_sizes = parse_list(args.rolling_window_size, int)
@@ -625,6 +647,10 @@ def main():
         logger.info(f"Loading CF panel ...")
         X_panel, y_target = load_cf_panel(data_dir, args.target, panel_arg=args.input_panel)
         logger.info(f"Panel shape: {X_panel.shape}, Target shape: {y_target.shape}")
+    
+    # 1.5 Filter feasible windows
+    requested_windows = parse_list(args.train_windows, int)
+    args.feasible_train_windows = filter_feasible_train_windows(requested_windows, len(y_target))
     
     # 2. Build Grid
     grid = generate_experiment_grid(args)

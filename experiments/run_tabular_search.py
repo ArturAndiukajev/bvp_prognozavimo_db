@@ -207,6 +207,25 @@ def build_parser() -> argparse.ArgumentParser:
 def _plist(s: str, dtype=str) -> list:
     return [dtype(v.strip()) for v in s.split(",") if v.strip()]
 
+def filter_feasible_train_windows(train_windows: List[int], n_total: int, min_test_steps: int = 5) -> List[int]:
+    """Filters train windows that are too large for the dataset."""
+    max_allowed = n_total - min_test_steps
+    feasible = [tw for tw in train_windows if tw < max_allowed]
+    
+    if not feasible:
+        # Fallback: generate windows as fractions of dataset length
+        if n_total > 15:
+            fallback = [int(n_total * 0.3), int(n_total * 0.5), int(n_total * 0.7)]
+        else:
+            fallback = [max(5, n_total - min_test_steps - 1)]
+        feasible = sorted(list(set(fallback)))
+        logger.info(f"Small dataset (n={n_total}): all requested windows were too large. Falling back to {feasible}")
+    else:
+        if len(feasible) < len(train_windows):
+            logger.info(f"Small dataset (n={n_total}): restricted train_windows to {feasible} from original set.")
+            
+    return feasible
+
 
 def _selector_param_grid(method: str, args: argparse.Namespace) -> List[dict]:
     if method == "none":
@@ -291,7 +310,7 @@ def _lgbm_model_grid(args: argparse.Namespace) -> List[dict]:
 def generate_grid(args: argparse.Namespace) -> List[Dict[str, Any]]:
     models_to_run    = _plist(args.models, str)
     selectors_to_run = _plist(args.selectors, str)
-    train_windows    = _plist(args.train_windows, int)
+    train_windows    = getattr(args, "feasible_train_windows", _plist(args.train_windows, int))
     step_sizes       = _plist(args.step_sizes, int)
 
     configs: List[Dict[str, Any]] = []
@@ -486,7 +505,8 @@ def optuna_objective(
     elif selector_name == "factor_analysis":
         selector_params["n_components"] = trial.suggest_int("fa_comp", 2, 20)
 
-    model_name = trial.suggest_categorical("model", ["elasticnet", "lightgbm"])
+    model_candidates = [m.strip() for m in args.models.split(",") if m.strip()]
+    model_name = trial.suggest_categorical("model", model_candidates)
     model_params = {}
     
     if model_name == "elasticnet":
@@ -506,7 +526,9 @@ def optuna_objective(
         model_params["reg_alpha"] = trial.suggest_float("lgbm_alpha", 1e-4, 1.0, log=True)
         model_params["reg_lambda"] = trial.suggest_float("lgbm_lambda", 1e-4, 1.0, log=True)
 
-    train_window = trial.suggest_categorical("train_window", [60, 80, 100, 120])
+    # Use the pre-filtered windows from args if available, otherwise fallback to defaults
+    tw_candidates = getattr(args, "feasible_train_windows", [60, 80, 100, 120])
+    train_window = trial.suggest_categorical("train_window", tw_candidates)
     step_size = trial.suggest_categorical("step_size", [1, 3])
 
     config = {
@@ -708,6 +730,10 @@ def main() -> None:
     logger.info("Loading panel ...")
     X_panel, y_target = load_cf_panel(data_dir, args.target, panel_arg=args.input_panel)
     logger.info(f"Panel: {X_panel.shape}  |  Target: {y_target.name}")
+
+    # 1.5 Filter feasible windows
+    requested_windows = _plist(args.train_windows, int)
+    args.feasible_train_windows = filter_feasible_train_windows(requested_windows, len(y_target))
 
     # Resolve panel stem for output filenames
     if args.input_panel:

@@ -3,7 +3,10 @@ from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMRegressor
+try:
+    from lightgbm import LGBMRegressor
+except Exception:
+    LGBMRegressor = None
 from sklearn.linear_model import ElasticNetCV
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline

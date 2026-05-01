@@ -255,236 +255,88 @@ alfred:
     realtime: true
 
 eurostat:
-  namq_10_gdp:
-    name: "GDP and main components (Quarterly)"
-    filters:
-      unit: ["CLV10_MNAC", "CP_MNAC"]
-      s_adj: ["SCA"]
-      na_item: ["B1GQ", "P3", "P6", "P7"]
-      geo: ["LT"]
-
-  namq_10_pc:
-    name: "Private consumption"
-    filters:
-      geo: ["LT"]
-
-  namq_10_cfc:
-    name: "Capital formation"
-    filters:
-      geo: ["LT"]
-
-  namq_10_exi:
-    name: "Exports/imports (quarterly)"
-    filters:
-      geo: ["LT"]
-
-  nama_10_lp_ulc:
-    name: "Labour productivity & unit labour costs"
-    filters:
-      geo: ["LT"]
-
-  nama_10_a10_e:
-    name: "Value added by industry"
+  sts_inpr_m:
+    name: "Industrial production, monthly"
     filters:
       geo: ["LT"]
 
   lfsi_emp_q:
-    name: "Employment (quarterly)"
+    name: "Employment, quarterly"
     filters:
-      geo: ["LT"]
-
-  lfsi_unemp_q:
-    name: "Unemployed persons"
-    filters:
-      geo: ["LT"]
-
-
-  lfsi_long_q:
-    name: "Long-term unemployment"
-    filters:
-      geo: ["LT"]
-
-  earn_ses_monthly:
-    name: "Long-term unemployment"
-    filters:
-      geo: ["LT"]
-
-  lc_lci_r2_q:
-    name: "Labour cost index"
-    filters:
-      geo: ["LT"]
-
-  lfsi_part_a:
-    name: "Labour force participation"
-    filters:
-      geo: ["LT"]
-
-  prc_ppi_m:
-    name: "Producer price index"
-    filters:
-      geo: ["LT"]
-
-  prc_fsc_idx:
-    name: "Food price index"
-    filters:
-      geo: ["LT"]
-
-  prc_hicp_aind:
-    name: "HICP by components"
-    filters:
-      geo: ["LT"]
-
-  prc_hpi_q:
-    name: "House price index"
-    filters:
-      geo: ["LT"]
-
-  ei_bcs_m:
-    name: "Consumer confidence"
-    filters:
-      geo: ["LT"]
-
-  ei_bcs_i:
-    name: "Industrial confidence"
-    filters:
-      geo: ["LT"]
-
-  sts_cinpr_m:
-    name: "Construction price index"
-    filters:
-      geo: ["LT"]
-
-  sbs_na_ind_r2:
-    name: "Structural business stats"
-    filters:
-      geo: ["LT"]
-
-  sbs_sc_sca_r2:
-    name: "Services"
-    filters:
-      geo: ["LT"]
-
-  sbs_na_sca_r2:
-    name: "Turnover"
-    filters:
-      geo: ["LT"]
-
-  env_wasmun:
-    name: "Municipal waste"
-    filters:
-      geo: ["LT"]
-
-  ext_lt_maineu:
-    name: "Trade with EU"
-    filters:
-      geo: ["LT"]
-
-  ext_lt_introle:
-    name: "Trade balance"
-    filters:
-      geo: ["LT"]
-
-  ext_lt_intratrd:
-    name: "Intrastat trade"
-    filters:
-      geo: ["LT"]
-
-  ext_lt_extra:
-    name: "Extra-EU trade"
-    filters:
-      geo: ["LT"]
-
-  tet00002:
-    name: "Export value"
-    filters:
-      geo: ["LT"]
-
-  tet00003:
-    name: "Import value"
-    filters:
-      geo: ["LT"]
-
-  ert_bil_eur_m:
-    name: "Bilateral trade"
-    filters:
-      geo: ["LT"]
-
-  bop_q_c:
-    name: "Balance of payments"
-    filters:
-      geo: ["LT"]
-
-  bop_iip_q:
-    name: "International investment position"
-    filters:
-      geo: ["LT"]
-
-  tec00021:
-    name: "Current account"
-    filters:
-      geo: ["LT"]
-
-  prc_hicp_midx:
-    name: "HICP - Harmonised Index of Consumer Prices (Monthly)"
-    filters:
-      unit: ["I15"]
-      coicop: ["CP00"]
-      geo: ["LT"]
-
-  une_rt_m:
-    name: "Unemployment by sex and age (Monthly)"
-    filters:
-      unit: ["PC_ACT"]
-      s_adj: ["SA"]
-      age: ["TOTAL"]
-      sex: ["T"]
-      geo: ["LT"]
-
-  sts_inpr_m:
-    name: "Industrial production (Monthly)"
-    filters:
-      unit: ["I15"]
-      s_adj: ["SCA"]
-      nace_r2: ["B-D"]
-      geo: ["LT"]
-
-  sts_copr_m:
-    name: "Production in construction (Monthly)"
-    filters:
-      unit: ["I15"]
-      s_adj: ["SCA"]
-      indic_bt: ["PROD"]
-      nace_r2: ["F"]
       geo: ["LT"]
 
   sts_trtu_m:
-    name: "Retail trade volume (Monthly)"
+    name: "Trade turnover, monthly"
     filters:
-      unit: ["I15"]
-      s_adj: ["SCA"]
-      nace_r2: ["G47"]
       geo: ["LT"]
 
-  ei_bcs_bs:
-    name: "Business and consumer surveys (Monthly)"
+  nasq_10_nf_tr:
+    name: "Sector accounts / non-financial transactions, quarterly"
     filters:
-      indic: ["BS-ESI-I"] # Economic Sentiment Indicator
-      s_adj: ["SA"]
       geo: ["LT"]
 
-  sts_inpp_m:
-    name: "Industrial producer prices (Monthly)"
+  namq_10_gdp:
+    name: "GDP and main components, quarterly"
     filters:
-      unit: ["I15"]
-      nace_r2: ["B-E36"] # Total industry
       geo: ["LT"]
 
-  jvs_q_nace2:
-    name: "Job vacancy rate (Quarterly)"
+  namq_10_exi:
+    name: "Exports/imports, quarterly"
     filters:
-      s_adj: ["SA"]
-      nace_r2: ["A-S"] # Total NACE
-      unit: ["PC_POP"] # Percentage of posts
-      sizeclas: ["TOTAL"]
+      geo: ["LT"]
+
+  ei_bsbu_m_r2:
+    name: "Business survey: building, monthly"
+    filters:
+      geo: ["LT"]
+
+  ei_bsco_m:
+    name: "Consumer survey, monthly"
+    filters:
+      geo: ["LT"]
+
+  namq_10_a10:
+    name: "Value added by industry, quarterly"
+    filters:
+      geo: ["LT"]
+
+  ei_bsin_q_r2:
+    name: "Business survey: industry, quarterly"
+    filters:
+      geo: ["LT"]
+
+  namq_10_an6:
+    name: "National accounts by asset, quarterly"
+    filters:
+      geo: ["LT"]
+
+  une_rt_m:
+    name: "Unemployment rate, monthly"
+    filters:
+      geo: ["LT"]
+
+  ei_lmhu_m:
+    name: "Labour market / unemployment expectations, monthly"
+    filters:
+      geo: ["LT"]
+
+  ei_bsin_m_r2:
+    name: "Business survey: industry, monthly"
+    filters:
+      geo: ["LT"]
+
+  gov_10q_ggnfa:
+    name: "Government finance, quarterly"
+    filters:
+      geo: ["LT"]
+
+  ei_bsse_m_r2:
+    name: "Business survey: services, monthly"
+    filters:
+      geo: ["LT"]
+
+  namq_10_lp_ulc:
+    name: "Labour productivity and unit labour costs, quarterly"
+    filters:
       geo: ["LT"]
 #

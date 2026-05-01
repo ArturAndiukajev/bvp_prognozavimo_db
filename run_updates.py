@@ -5,7 +5,7 @@ from scripts import load_alfred
 from scripts import load_eurostat
 from scripts import load_google_trends
 from scripts import load_financials
-from scripts import load_statgov_all_flows
+#from scripts import load_statgov_all_flows
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("updates")
@@ -19,7 +19,7 @@ def main():
         "Eurostat":      lambda: load_eurostat.main(mode="update"),
         "Google Trends": lambda: load_google_trends.main(mode="update"),
         "Financials":    lambda: load_financials.main(mode="update"),
-        "StatGov":   lambda: load_statgov_all_flows.main(mode="update", workers=2),
+        #"StatGov":   lambda: load_statgov_all_flows.main(mode="update", workers=2),
     }
 
     for name, fn in sources.items():
