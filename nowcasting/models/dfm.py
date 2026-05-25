@@ -69,6 +69,7 @@ class DynamicFactorNowcast(BaseNowcastModel):
         self.tolerance = kwargs.get("tolerance", 1e-5)
         self.allow_unconditional_fallback = kwargs.get("allow_unconditional_fallback", False)
         self.fitted_res_ = None
+        self.last_prediction_info = {}
 
     # ------------------------------------------------------------------
     def fit(self, X_train: pd.DataFrame, y_train: pd.Series) -> "DynamicFactorNowcast":
@@ -193,7 +194,26 @@ class DynamicFactorNowcast(BaseNowcastModel):
 
         try:
             extended_res = self.fitted_res_.append(test_endog, refit=False)
-            predictions = extended_res.fittedvalues[self.target_col].iloc[-len(X_test):]
+            try:
+                # Use get_prediction(information_set="filtered") for nowcasting (filtered estimates)
+                try:
+                    pred_obj = extended_res.get_prediction(information_set="filtered")
+                    info_set = "filtered"
+                    logger.info(f"[DFM-CF] Using get_prediction(information_set='filtered') for conditional nowcast.")
+                except Exception as e_filt:
+                    logger.warning(f"[DFM-CF] information_set='filtered' failed: {e_filt}. Trying 'predicted'.")
+                    pred_obj = extended_res.get_prediction(information_set="predicted")
+                    info_set = "predicted"
+                    logger.warning("[DFM-CF] Using one-step-ahead 'predicted' estimates; nowcast may be lagged.")
+                
+                predictions = pred_obj.predicted_mean[self.target_col].iloc[-len(X_test):]
+                self.last_prediction_info["dfm_prediction_information_set"] = info_set
+            except Exception as e_pred:
+                logger.warning(f"[DFM-CF] get_prediction failed: {e_pred}. Falling back to fittedvalues.")
+                predictions = extended_res.fittedvalues[self.target_col].iloc[-len(X_test):]
+                self.last_prediction_info["dfm_prediction_information_set"] = "fittedvalues_fallback"
+                logger.warning("[DFM-CF] Using fittedvalues fallback; this is one-step-ahead and likely lagged.")
+                
             return pd.Series(predictions.values, index=X_test.index, name=f"{self.target_col}_pred")
         except Exception as e:
             msg = f"[DFM-CF] predict append failed: {e}."
@@ -250,7 +270,26 @@ class DynamicFactorNowcast(BaseNowcastModel):
                 refit=False
             )
 
-            predictions = extended_res.fittedvalues[self.target_col]
+            try:
+                # Mixed-frequency DFM
+                try:
+                    pred_obj = extended_res.get_prediction(information_set="filtered")
+                    info_set = "filtered"
+                    logger.info(f"[DFM-MF] Using get_prediction(information_set='filtered') for conditional nowcast.")
+                except Exception as e_filt:
+                    logger.warning(f"[DFM-MF] information_set='filtered' failed or not supported: {e_filt}. Using default get_prediction().")
+                    pred_obj = extended_res.get_prediction()
+                    info_set = "predicted" # Default is one-step-ahead
+                    logger.warning("[DFM-MF] Using default 'predicted' estimates; nowcast may be lagged.")
+                
+                predictions = pred_obj.predicted_mean[self.target_col]
+                self.last_prediction_info["dfm_prediction_information_set"] = info_set
+            except Exception as e_pred:
+                logger.warning(f"[DFM-MF] get_prediction failed: {e_pred}. Falling back to fittedvalues.")
+                predictions = extended_res.fittedvalues[self.target_col]
+                self.last_prediction_info["dfm_prediction_information_set"] = "fittedvalues_fallback"
+                logger.warning("[DFM-MF] Using fittedvalues fallback; this is one-step-ahead and likely lagged.")
+
             # Return the tail corresponding to X_test
             # Note: For quarterly targets in a monthly model, this series will have NaNs for non-quarter-end months.
             return predictions.iloc[-len(X_test):]

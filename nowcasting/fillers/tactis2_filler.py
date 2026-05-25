@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import time
 import pandas as pd
@@ -236,8 +237,17 @@ class TACTiS2Filler:
         if panel_path.exists() and not force_refit:
             logger.info(f"Loading cached TACTiS2 filled panel from {panel_path}")
             X_filled_m = pd.read_parquet(panel_path)
-            # We don't return the audit DF if loading from cache for now (unless saved separately)
-            return X_filled_m, pd.DataFrame()
+            diag_path = panel_path.with_suffix(".json")
+            if diag_path.exists():
+                try:
+                    with open(diag_path, "r") as f:
+                        diagnostics = json.load(f)
+                    diagnostics["tactis2_loaded_from_cache"] = True
+                    return X_filled_m, diagnostics
+                except Exception as e:
+                    logger.warning(f"Failed to load TACTiS2 diagnostics from {diag_path}: {e}")
+            
+            return X_filled_m, {"tactis2_loaded_from_cache": True}
 
         # 1. Identify series needing filling and group them by last_valid_date
         cols = [c for c in X_visible_m.columns if c not in exclude_cols]
@@ -253,8 +263,6 @@ class TACTiS2Filler:
                 if last_date not in origin_groups:
                     origin_groups[last_date] = []
                 origin_groups[last_date].append(col)
-        
-        # 2. Preparation
         # 2. Preparation
         X_filled_m = X_visible_m.copy()
 
@@ -299,7 +307,6 @@ class TACTiS2Filler:
 
             # Safety check: TACTiS2/GluonTS transformation can fail if prediction_length 
             # is too large for the available history, or if it's too long for a nowcasting model.
-            # We also skip TACTiS2 for horizons > 4 years as it's not designed for long-term stagnant filling.
             min_req_history = 24 # We want at least 2 years of history to train a meaningful factor
             if actual_prediction_length > 48 or len(X_train_input) < (actual_prediction_length + min_req_history):
                 logger.warning(f"Origin {origin_date}: Horizon {actual_prediction_length} or history {len(X_train_input)} unsuitable for TACTiS2. Falling back to ffill.")
@@ -487,7 +494,16 @@ class TACTiS2Filler:
             "tactis2_clip_gradient": self.clip_gradient,
             "tactis2_bagging_size": self.bagging_size,
             "tactis2_skip_copula": self.skip_copula if not self.author_config else False,
-            "tactis2_num_samples": self.num_samples
+            "tactis2_num_samples": self.num_samples,
+            "tactis2_loaded_from_cache": False
         }
+        
+        # Save diagnostics to JSON
+        try:
+            diag_path = panel_path.with_suffix(".json")
+            with open(diag_path, "w") as f:
+                json.dump(diagnostics, f, indent=4)
+        except Exception as e:
+            logger.warning(f"Failed to save TACTiS2 diagnostics to {diag_path}: {e}")
             
         return X_filled_m, diagnostics

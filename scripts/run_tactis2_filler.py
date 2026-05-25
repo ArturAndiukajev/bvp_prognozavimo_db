@@ -3,6 +3,7 @@ import sys
 import argparse
 import logging
 import pandas as pd
+import numpy as np
 from pathlib import Path
 
 # Add project root to sys.path
@@ -24,6 +25,7 @@ def main():
     parser.add_argument("--train-start", type=str, default="2000-01-01", help="Training start date")
     parser.add_argument("--monthly-feature-release-lag-months", type=int, default=1, help="Macro release lag")
     parser.add_argument("--gt-release-lag-months", type=int, default=0, help="Google Trends release lag")
+    parser.add_argument("--quarterly-feature-release-lag-months", type=int, default=1, help="Quarterly feature release lag")
     parser.add_argument("--seed", type=int, default=2234, help="Random seed")
     parser.add_argument("--max-epochs", type=int, default=1, help="Max epochs for TACTiS2")
     parser.add_argument("--context-length", type=int, default=120, help="Context length")
@@ -31,11 +33,15 @@ def main():
     parser.add_argument("--device", type=str, default="auto", help="torch device")
     parser.add_argument("--force-refit", action="store_true", help="Force retraining TACTiS2")
     parser.add_argument("--debug-preselect-top-k", type=int, default=None, help="Keep only top K features by absolute correlation with visible target.")
+    parser.add_argument("--gt-suffix", type=str, default="", help="Suffix for Google Trends datasets (e.g. lt or v1)")
     
     args = parser.parse_args()
     
     dm = LocalDataManager(_PROJECT_ROOT)
-    X, y, info = dm.load_or_build_dataset(args.dataset, force_rebuild=False)
+    if args.dataset.startswith("final_thesis_"):
+        X, y, info = dm.load_frequency_aware_data(args.dataset.replace("final_thesis_", ""), gt_suffix=args.gt_suffix)
+    else:
+        X, y, info = dm.load_or_build_dataset(args.dataset, force_rebuild=False)
     
     vb = VintageBuilder(dataset_name=args.dataset, random_state=args.seed)
     target_q_end = pd.Period(args.target_quarter, freq='Q').end_time.normalize()
@@ -45,15 +51,22 @@ def main():
     
     # Simulate VintageBuilder truncation/masking logic for the filler input
     X_visible = X.copy()
+    col_freqs = {str(k): v for k, v in dm._column_frequencies.items()} if hasattr(dm, "_column_frequencies") else {}
+    
     for col in X_visible.columns:
-        if col.startswith("gt_") or "_gt" in col or col.startswith("GT_"):
+        col_str = str(col)
+        freq = col_freqs.get(col_str, "M")
+        
+        if freq == "GT" or col_str.startswith("gt_") or "_gt" in col_str or col_str.startswith("GT_"):
             lag = args.gt_release_lag_months
+        elif freq == "Q":
+            lag = args.quarterly_feature_release_lag_months
         else:
             lag = args.monthly_feature_release_lag_months
             
         if lag > 0:
             max_obs_date = cutoff_date - pd.offsets.MonthEnd(lag)
-            X_visible.loc[X_visible.index > max_obs_date, col] = pd.NA
+            X_visible.loc[X_visible.index > max_obs_date, col] = np.nan
             
     X_visible = X_visible[X_visible.index <= cutoff_date]
     X_visible = X_visible[X_visible.index >= pd.Timestamp(args.train_start)]

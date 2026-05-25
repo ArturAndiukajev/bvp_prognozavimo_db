@@ -7,7 +7,7 @@ try:
     from lightgbm import LGBMRegressor
 except Exception:
     LGBMRegressor = None
-from sklearn.linear_model import ElasticNetCV
+from sklearn.linear_model import ElasticNet, ElasticNetCV
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -26,12 +26,15 @@ class ElasticNetNowcast(BaseNowcastModel):
     fill_strategy : str
         How to fill NaN values before fitting. Options:
         'zero' (default), 'mean', 'median', 'ffill_then_zero'.
-    cv : int
-        Number of cross-validation folds for ElasticNetCV (default 5).
+    use_cv : bool
+        Whether to use cross-validation (default True).
+    alpha : float
+        Constant that multiplies the penalty terms (default 1e-5). Only used if use_cv is False.
+    l1_ratio : float or list of float
+        The ElasticNet mixing parameter. If use_cv is True, it's a list of floats to search over.
+        If use_cv is False, it's a single float (default 0.25).
     max_iter : int
         Maximum iterations for coordinate descent (default 2000).
-    l1_ratio : float or list of float
-        L1 ratio(s) to search over in ElasticNetCV (default [0.1,0.5,0.7,0.9,0.95,1.0]).
     """
     def __init__(
         self,
@@ -39,20 +42,30 @@ class ElasticNetNowcast(BaseNowcastModel):
         horizon: int = 1,
         fill_strategy: str = "zero",
         cv: int = 5,
-        max_iter: int = 2000,
+        use_cv: bool = True,
+        alpha: float = 1e-5,
         l1_ratio: Union[float, List[float], None] = None,
+        max_iter: int = 2000,
         **kwargs,
     ):
         super().__init__(target_col, horizon, **kwargs)
         seed = kwargs.get("random_state", kwargs.get("seed", 123))
         self.fill_strategy = fill_strategy
-        _l1 = l1_ratio if l1_ratio is not None else [0.1, 0.5, 0.7, 0.9, 0.95, 1.0]
-        
-        cv_splitter = TimeSeriesSplit(n_splits=cv)
+        self.use_cv = use_cv
+        self.alpha = alpha
+        self.max_iter = max_iter
+
+        if self.use_cv:
+            self.l1_ratio = l1_ratio if l1_ratio is not None else [0.1, 0.5, 0.7, 0.9, 0.95, 1.0]
+            cv_splitter = TimeSeriesSplit(n_splits=cv)
+            enet = ElasticNetCV(cv=cv_splitter, random_state=seed, max_iter=self.max_iter, l1_ratio=self.l1_ratio)
+        else:
+            self.l1_ratio = l1_ratio if l1_ratio is not None else 0.25
+            enet = ElasticNet(alpha=self.alpha, l1_ratio=self.l1_ratio, max_iter=self.max_iter, random_state=seed)
         
         self.model = Pipeline([
             ("scaler", StandardScaler()),
-            ("enet", ElasticNetCV(cv=cv_splitter, random_state=seed, max_iter=max_iter, l1_ratio=_l1))
+            ("enet", enet)
         ])
 
     # ------------------------------------------------------------------
@@ -67,6 +80,11 @@ class ElasticNetNowcast(BaseNowcastModel):
             return df.fillna(0)
 
     def fit(self, X_train: pd.DataFrame, y_train: pd.Series):
+        if self.use_cv:
+            logger.info("ElasticNetNowcast using CV-based ElasticNet")
+        else:
+            logger.info(f"ElasticNetNowcast using fixed alpha={self.alpha}, l1_ratio={self.l1_ratio}")
+
         valid_idx = y_train.notna()
         X_train_clean = self._fill(X_train.loc[valid_idx])
         y_train_clean = y_train.loc[valid_idx]

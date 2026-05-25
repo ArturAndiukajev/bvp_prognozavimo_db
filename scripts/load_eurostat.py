@@ -1,4 +1,4 @@
-﻿"""
+"""
 Šitas failas skirtas eurostat duomenims atsiųsti.
 automatiškai atsisiunčia pasirinktus duomenų rinkinius, pritaiko filtrus,
 išsaugo neapdorotus duomenis, transformuoja juos į laiko eilučių formatą ir įrašo į
@@ -331,14 +331,42 @@ def ingest_dataset(dataset_code: str, dataset_cfg: dict, mode: str = "initial"):
 
 def main(mode: str = "initial", max_workers: int = 4):
     config = load_config()
-    euro_cfg = config.get("eurostat", {}) if isinstance(config, dict) else {}
-
-    if not euro_cfg:
-        logger.warning("No 'eurostat' section in config.")
+    if not isinstance(config, dict):
+        logger.warning("Invalid config format.")
         return
 
+    # 1. Base Eurostat datasets
+    euro_cfg = config.get("eurostat", {})
+    
+    # 2. Check for automatic autolist (from eurostat_auto cache_path)
+    auto_cfg = config.get("eurostat_auto", {})
+    cache_path = auto_cfg.get("cache_path")
+    if cache_path:
+        cache_file = Path(cache_path)
+        if cache_file.exists():
+            logger.info(f"Loading automatic Eurostat list from {cache_file}...")
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    auto_list = yaml.safe_load(f)
+                    if isinstance(auto_list, dict) and "eurostat" in auto_list:
+                        # Merge into main pool
+                        auto_datasets = auto_list["eurostat"]
+                        logger.info(f"Merging {len(auto_datasets)} datasets from autolist.")
+                        for k, v in auto_datasets.items():
+                            if k not in euro_cfg:
+                                euro_cfg[k] = v
+            except Exception as e:
+                logger.error(f"Failed to load autolist: {e}")
+        else:
+            logger.warning(f"Autolist cache_path configured but file not found: {cache_path}")
+
+    if not euro_cfg:
+        logger.warning("No Eurostat datasets found to load.")
+        return
+
+    import yaml # Local import for main
     items = list(euro_cfg.items())
-    logger.info(f"Eurostat main: mode={mode}, datasets={len(items)}, max_workers={max_workers}")
+    logger.info(f"Eurostat main: mode={mode}, total_datasets={len(items)}, max_workers={max_workers}")
 
     if max_workers <= 1:
         for dataset_code, dataset_cfg in items:

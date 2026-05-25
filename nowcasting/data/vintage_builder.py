@@ -25,6 +25,10 @@ def map_to_target_quarter(date: pd.Timestamp) -> str:
     q = (date.month - 1) // 3 + 1
     return f"{date.year}Q{q}"
 
+def normalize_vintage_label(v):
+    """Standardized vintage label: '+2' -> '2', '-1' -> '-1'"""
+    return str(v).replace("+", "")
+
 def test_vintage_cutoffs():
     """Self-test for month-relative vintage cutoff logic."""
     vb = VintageBuilder(vintage_label_mode="month_relative_to_quarter_end")
@@ -243,11 +247,18 @@ class VintageBuilder:
         preds = np.full(steps, s.iloc[-1])
         return preds, "sktime_autoarima_failed_locf"
 
-    def _build_vertical_realignment_panel(self, X_visible: pd.DataFrame, target_quarter_end: pd.Timestamp, metadata: dict, col_freqs: Dict[str, str]) -> pd.DataFrame:
+    def _build_vertical_realignment_panel(self, X_visible: pd.DataFrame, target_quarter_end: pd.Timestamp, metadata: dict, col_freqs: Dict[str, str], mode: str = "calendar_blocks") -> pd.DataFrame:
         """
         Converts a monthly ragged panel into a blocked quarterly panel with vertical realignment.
-        1 monthly feature -> 3 quarterly blocked features (M1, M2, M3).
-        Quarterly features are kept as single quarterly features.
+        
+        Modes:
+        - "calendar_blocks": Converts 1 monthly feature into 3 fixed calendar months (M1, M2, M3).
+          If month 3 is missing at the ragged edge, it remains NaN or is ffilled from the PREVIOUS quarter's M3.
+        - "most_recent_lags": Realigns each monthly feature based on its latest available observation.
+          1 monthly feature -> {feat}_most_recent, {feat}_lag1, {feat}_lag2.
+          This ensures the model always sees the 'freshest' possible data in the same column position.
+          
+        Quarterly features are kept as single quarterly features in both modes.
         Incomplete blocks at the ragged edge are forward-filled with the last available aligned block.
         """
         # Split columns by frequency
@@ -261,36 +272,101 @@ class VintageBuilder:
         
         # 1. Monthly and GT features (Blocking + Vertical Realignment)
         if m_gt_cols:
-            X_m_visible = X_visible[m_gt_cols]
-            q_dates = X_m_visible.index.to_period("Q").end_time.normalize()
-            moq = (X_m_visible.index.month - 1) % 3 + 1
-            
-            X_blocked = X_m_visible.copy()
-            X_blocked['__q'] = q_dates
-            X_blocked['__moq'] = moq
-            
-            # Pivot to quarterly blocks
-            X_q_m = X_blocked.pivot(index='__q', columns='__moq')
-            X_q_m.columns = [f"{c[0]}_m{c[1]}" for c in X_q_m.columns]
-            
-            # Ensure target_quarter_end is in index if not present
-            if target_quarter_end not in X_q_m.index:
-                X_q_m = X_q_m.reindex(X_q_m.index.union([target_quarter_end]))
+            if mode == "calendar_blocks":
+                X_m_visible = X_visible[m_gt_cols]
+                q_dates = X_m_visible.index.to_period("Q").end_time.normalize()
+                moq = (X_m_visible.index.month - 1) % 3 + 1
                 
-            # Count missing before ffill
-            missing_before = X_q_m.isna().sum().sum()
+                X_blocked = X_m_visible.copy()
+                X_blocked['__q'] = q_dates
+                X_blocked['__moq'] = moq
+                
+                # Pivot to quarterly blocks
+                X_q_m = X_blocked.pivot(index='__q', columns='__moq')
+                X_q_m.columns = [f"{c[0]}_m{c[1]}" for c in X_q_m.columns]
+                
+                # Ensure target_quarter_end is in index if not present
+                if target_quarter_end not in X_q_m.index:
+                    X_q_m = X_q_m.reindex(X_q_m.index.union([target_quarter_end]))
+                    
+                # Count missing before ffill
+                missing_before = X_q_m.isna().sum().sum()
+                
+                # Vertical Realignment (ffill missing aligned blocks over quarters)
+                X_q_m_ffilled = X_q_m.ffill()
+                
+                missing_after = X_q_m_ffilled.isna().sum().sum()
+                
+                metadata["vertical_realignment_features_total"] = len(X_q_m.columns)
+                metadata["vertical_realignment_missing_before"] = int(missing_before)
+                metadata["vertical_realignment_missing_after"] = int(missing_after)
+                metadata["vertical_realignment_blocks_ffilled"] = int(missing_before - missing_after)
+                
+                X_q_list.append(X_q_m_ffilled)
             
-            # Vertical Realignment (ffill missing aligned blocks over quarters)
-            X_q_m_ffilled = X_q_m.ffill()
+            elif mode == "most_recent_lags":
+                logger.info("Building 'most_recent_lags' realignment panel...")
+                q_idx = pd.date_range(start=X_visible.index.min(), end=target_quarter_end, freq='Q').normalize()
+                X_q_m = pd.DataFrame(index=q_idx)
+                
+                realigned_count = 0
+                missing_lag_count = 0
+                
+                for col in m_gt_cols:
+                    s_full = X_visible[col].dropna()
+                    if s_full.empty:
+                        continue
+                        
+                    res_most_recent = []
+                    res_lag1 = []
+                    res_lag2 = []
+                    
+                    for q_end in q_idx:
+                        # Consider only data visible as of this quarter (respecting global cutoff)
+                        # We use the full X_visible which already applied the global vintage cutoff.
+                        s_vis = s_full[s_full.index <= q_end]
+                        
+                        if len(s_vis) >= 1:
+                            res_most_recent.append(s_vis.iloc[-1])
+                            realigned_count += 1
+                        else:
+                            res_most_recent.append(np.nan)
+                            
+                        if len(s_vis) >= 2:
+                            res_lag1.append(s_vis.iloc[-2])
+                        else:
+                            res_lag1.append(np.nan)
+                            missing_lag_count += 1
+                            
+                        if len(s_vis) >= 3:
+                            res_lag2.append(s_vis.iloc[-3])
+                        else:
+                            res_lag2.append(np.nan)
+                            missing_lag_count += 1
+                            
+                    X_q_m[f"{col}_most_recent"] = res_most_recent
+                    X_q_m[f"{col}_lag1"] = res_lag1
+                    X_q_m[f"{col}_lag2"] = res_lag2
+                
+                # Forward fill to handle gaps between releases if any, but only forward
+                missing_before = X_q_m.isna().sum().sum()
+                X_q_m_ffilled = X_q_m.ffill()
+                missing_after = X_q_m_ffilled.isna().sum().sum()
+                
+                metadata["vertical_realignment_features_total"] = len(X_q_m.columns)
+                metadata["vertical_realignment_realigned_values"] = realigned_count
+                metadata["vertical_realignment_missing_lag_values"] = missing_lag_count
+                metadata["vertical_realignment_missing_before"] = int(missing_before)
+                metadata["vertical_realignment_missing_after"] = int(missing_after)
+                metadata["vertical_realignment_blocks_ffilled"] = int(missing_before - missing_after)
+                
+                X_q_list.append(X_q_m_ffilled)
             
-            missing_after = X_q_m_ffilled.isna().sum().sum()
-            
-            metadata["vertical_realignment_features_total"] = len(X_q_m.columns)
-            metadata["vertical_realignment_missing_before"] = int(missing_before)
-            metadata["vertical_realignment_missing_after"] = int(missing_after)
-            metadata["vertical_realignment_blocks_ffilled"] = int(missing_before - missing_after)
-            
-            X_q_list.append(X_q_m_ffilled)
+            else:
+                raise ValueError(
+                    f"Unknown vertical_realignment mode: {mode}. "
+                    "Expected 'calendar_blocks' or 'most_recent_lags'."
+                )
 
         # 2. Quarterly features (Direct Resampling)
         if q_cols:
@@ -419,6 +495,7 @@ class VintageBuilder:
         quarterly_feature_release_lag_months: int = 1,
         train_start: Optional[pd.Timestamp] = None,
         rolling_window_quarters: Optional[int] = None,
+        allow_backcast_target_in_train: bool = False,
         column_frequencies: Dict[str, str] = None
     ) -> Tuple[pd.DataFrame, pd.Series, float, Dict[str, str], Dict[str, Any]]:
         """
@@ -432,7 +509,12 @@ class VintageBuilder:
             train_start, rolling_window_quarters, column_frequencies
         )
         
-        y_train_q = y_visible[y_visible.index < target_quarter_end].dropna()
+        if allow_backcast_target_in_train and int(normalize_vintage_label(vintage_label)) > 0:
+            # Allow target quarter in train for vintages +1, +2
+            y_train_q = y_visible[y_visible.index <= target_quarter_end].dropna()
+        else:
+            y_train_q = y_visible[y_visible.index < target_quarter_end].dropna()
+            
         y_actual = y.loc[target_quarter_end] if target_quarter_end in y.index else np.nan
         if isinstance(y_actual, pd.Series):
              y_actual = y_actual.iloc[0]
@@ -452,7 +534,9 @@ class VintageBuilder:
         rolling_window_quarters: Optional[int] = None,
         fill_method: str = "autoarima",
         aggregation_method: str = "mean",
-        debug_preselect_top_k: Optional[int] = None,
+        vertical_realignment_mode: str = "calendar_blocks",
+        preselect_top_k_before_fill: Optional[int] = None,
+        debug_preselect_top_k: Optional[int] = None, # backward compatibility
         macro_release_lag_months: int = 1,
         gt_release_lag_months: int = 0,
         quarterly_feature_release_lag_months: int = 1,
@@ -472,6 +556,7 @@ class VintageBuilder:
         tactis2_num_samples: Optional[int] = None,
         tactis2_device: str = "auto",
         tactis2_force_refit: bool = False,
+        allow_backcast_target_in_train: bool = False,
         column_frequencies: Dict[str, str] = None
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame, float, Dict[str, Any]]:
         
@@ -491,28 +576,66 @@ class VintageBuilder:
             "series_autoarima_empty_series": 0,
             "series_autoarima_no_steps": 0,
             "series_locf": 0,
-            "series_unfilled": 0
+            "series_rolling_mean": 0,
+            "series_tactis2_failed_fallback": 0,
+            "series_unfilled": 0,
+            "preselect_before_fill_method": None,
+            "preselect_before_fill_top_k": None,
+            "preselect_before_fill_features_before": len(X_visible.columns),
+            "preselect_before_fill_features_after": len(X_visible.columns)
         })
 
-        if debug_preselect_top_k is not None and debug_preselect_top_k < len(X_visible.columns):
-            # Calculate correlation with visible y
-            y_vis_avail = y_visible.dropna()
-            if len(y_vis_avail) > 5:
+        if preselect_top_k_before_fill is None and debug_preselect_top_k is not None:
+            preselect_top_k_before_fill = debug_preselect_top_k
+
+        if (
+            fill_method == "tactis2"
+            and preselect_top_k_before_fill is not None 
+            and preselect_top_k_before_fill < len(X_visible.columns)
+        ):
+            # POINT 4 & 5: Leakage-free preselection before filling
+            # Use only training target (strictly before target_quarter_end)
+            y_train_vis = y_visible[y_visible.index < target_quarter_end].dropna()
+            
+            if len(y_train_vis) > 5:
+                # Aggregate visible X to quarterly for correlation check
                 X_vis_q = X_visible.resample("Q").mean()
-                shared_idx = y_vis_avail.index.intersection(X_vis_q.index)
+                shared_idx = y_train_vis.index.intersection(X_vis_q.index)
+                
                 if len(shared_idx) > 5:
-                    corrs = X_vis_q.loc[shared_idx].corrwith(y_vis_avail.loc[shared_idx]).abs()
+                    features_before = len(X_visible.columns)
+                    corrs = X_vis_q.loc[shared_idx].corrwith(y_train_vis.loc[shared_idx]).abs()
                     corrs = corrs.sort_values(ascending=False).dropna()
-                    top_cols = corrs.head(debug_preselect_top_k).index.tolist()
+                    top_cols = corrs.head(preselect_top_k_before_fill).index.tolist()
+                    
+                    metadata["preselect_before_fill_method"] = "corr_top_n"
+                    metadata["preselect_before_fill_top_k"] = preselect_top_k_before_fill
+                    metadata["preselect_before_fill_features_before"] = features_before
+                    
                     X_visible = X_visible[top_cols]
+                    features_after = len(X_visible.columns)
+                    
+                    metadata["preselect_before_fill_features_after"] = features_after
+                    logger.info(
+                        f"[{target_quarter_end.date()} v{vintage_label}] "
+                        f"Preselect before TACTiS-2: {features_before} -> {features_after} "
+                        f"(top_k={preselect_top_k_before_fill})"
+                    )
+                else:
+                    logger.warning(f"[{target_quarter_end.date()} v{vintage_label}] Not enough shared training observations for preselection.")
+        elif preselect_top_k_before_fill is not None:
+            logger.debug(
+                f"preselect_top_k_before_fill={preselect_top_k_before_fill} ignored for fill_method={fill_method}; only applied to tactis2."
+            )
 
         # ---------------------------------------------------------
         # 4. Ragged Edge Filling & Aggregation
         # ---------------------------------------------------------
         if fill_method == "vertical_realignment":
-            logger.info("Applying Vertical Realignment (Blocking)...")
+            logger.info(f"Applying Vertical Realignment (Mode: {vertical_realignment_mode})...")
+            metadata["vertical_realignment_mode"] = vertical_realignment_mode
             X_filled_m = X_visible.copy()
-            X_q = self._build_vertical_realignment_panel(X_visible, target_quarter_end, metadata, col_freqs)
+            X_q = self._build_vertical_realignment_panel(X_visible, target_quarter_end, metadata, col_freqs, mode=vertical_realignment_mode)
             # Skip standard aggregation since we are already quarterly
         else:
             if target_quarter_end > X_visible.index.max():
@@ -631,19 +754,31 @@ class VintageBuilder:
                             if fill_method == "locf":
                                 preds = np.full(steps, s.iloc[-1])
                                 metadata["series_locf"] += 1
-                            else:
+                            elif fill_method == "rolling_mean":
                                 val = s.tail(12).mean()
                                 preds = np.full(steps, val)
-                                metadata["series_locf"] += 1
-                                if freq in ["Q", "QE"]:
-                                    fill_idx = pd.date_range(start=last_valid_date + pd.offsets.QuarterEnd(1), 
-                                                             end=target_quarter_end, freq='Q')
-                                else:
-                                    fill_idx = X_filled_m.loc[last_valid_date + pd.offsets.MonthEnd(1) : target_quarter_end].index
+                                metadata["series_rolling_mean"] += 1
+                            else: # tactis2 fallback
+                                preds = np.full(steps, s.iloc[-1])
+                                metadata["series_tactis2_failed_fallback"] = metadata.get("series_tactis2_failed_fallback", 0) + 1
+                                
+                            if freq in ["Q", "QE"]:
+                                fill_idx = pd.date_range(start=last_valid_date + pd.offsets.QuarterEnd(1), 
+                                                         end=target_quarter_end, freq='Q')
+                            else:
+                                fill_idx = X_filled_m.loc[last_valid_date + pd.offsets.MonthEnd(1) : target_quarter_end].index
+                            
+                            if len(fill_idx) != len(preds):
+                                logger.warning(f"Length mismatch for {col}: fill_idx={len(fill_idx)}, preds={len(preds)}. Truncating.")
+                                X_filled_m.loc[fill_idx, col] = preds[:len(fill_idx)]
+                            else:
                                 X_filled_m.loc[fill_idx, col] = preds
                 
                 # Removed bfill to prevent leakage. Only ffill forward if absolutely necessary.
+                metadata["missing_before_final_ffill"] = int(X_filled_m.isna().sum().sum())
                 X_filled_m = X_filled_m.ffill()
+                metadata["missing_after_final_ffill"] = int(X_filled_m.isna().sum().sum())
+                metadata["values_filled_by_final_ffill"] = metadata["missing_before_final_ffill"] - metadata["missing_after_final_ffill"]
     
             # ---------------------------------------------------------
             # 5. Mixed-Frequency Aggregation
@@ -680,7 +815,13 @@ class VintageBuilder:
         # 6. Split Train and Test Sets & Align
         # ---------------------------------------------------------
         X_train_q = X_q[X_q.index < target_quarter_end]
-        y_train_q = y_q[y_q.index < target_quarter_end]
+        
+        if allow_backcast_target_in_train and int(normalize_vintage_label(vintage_label)) > 0:
+            y_q_train_mask = (y_q.index <= target_quarter_end)
+        else:
+            y_q_train_mask = (y_q.index < target_quarter_end)
+            
+        y_train_q = y_q[y_q_train_mask]
         
         # Drop all rows where y_train_q is NaN and align X_train_q
         valid_train_idx = y_train_q.dropna().index

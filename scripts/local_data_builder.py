@@ -4,9 +4,8 @@ Handles loading, joining, and vintage generation without DB dependencies.
 Improved for local Lithuania/Eurostat experiments.
 """
 import logging
-import os
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple, Any
+from typing import List, Tuple
 import pandas as pd
 import numpy as np
 
@@ -97,9 +96,7 @@ class LocalDataManager:
         Loads Google Trends data from local raw or processed files.
         Ensures only GT features are returned, avoiding macro column leakage.
         """
-        # We try to get macro columns to filter them out in case of fallback files
         try:
-            # We don't use load_or_build_dataset here to avoid recursion
             path_m = self._find_file(["common_final_nowcast_dataset.parquet", "common_final_nowcast_dataset1.parquet"])
             df_m = pd.read_parquet(path_m)
             macro_cols = set(df_m.columns)
@@ -107,12 +104,10 @@ class LocalDataManager:
             macro_cols = set()
 
         df = pd.DataFrame()
-        # Try processed first
         try:
             path = self._find_file(["google_trends_processed.parquet", "gt_data.parquet"])
             df = pd.read_parquet(path)
         except FileNotFoundError:
-            # Try to build from raw CSVs in data/raw/google_trends
             raw_dir = _PROJECT_ROOT / "data" / "raw" / "google_trends"
             if raw_dir.exists():
                 logger.info(f"Aggregating raw GT CSVs from {raw_dir}...")
@@ -122,14 +117,12 @@ class LocalDataManager:
                 
                 all_dfs = []
                 for c in csvs:
-                    # FIX: index_col instead of index_index
                     tmp = pd.read_csv(c, index_col=0, parse_dates=True)
                     all_dfs.append(tmp)
                 df = pd.concat(all_dfs, axis=1)
                 # Resample to monthly (end of month)
                 df = df.resample("M").mean()
             else:
-                # Last resort: try to extract from any file that might have it
                 try:
                     path = self._find_file(["common_with_google_trends.parquet", "gt_plus_target.parquet"])
                     df = pd.read_parquet(path)
@@ -237,14 +230,31 @@ class LocalDataManager:
         
         return X, y
 
-    def load_frequency_aware_data(self, name: str) -> Tuple[pd.DataFrame, pd.Series, str]:
+    def load_frequency_aware_data(self, name: str, gt_suffix: str = "") -> Tuple[pd.DataFrame, pd.Series, str]:
         """Loads frequency-aware datasets prepared by prepare_selected_frequency_aware_data.py."""
         proc_dir = self.data_dir / "data" / "processed"
-        logger.info(f"Loading frequency-aware components for: {name}")
+        
+        # Automatic suffix detection from name if not provided
+        if not gt_suffix:
+            for sfx in ["v1", "lt"]:
+                if name.endswith(f"_{sfx}"):
+                    gt_suffix = sfx
+                    logger.info(f"Detected GT suffix '{gt_suffix}' from dataset name '{name}'")
+                    break
+
+        # Base name for internal dataset logic (stripping suffix)
+        base_name = name
+        if gt_suffix and base_name.endswith(f"_{gt_suffix}"):
+            base_name = base_name.replace(f"_{gt_suffix}", "")
+
+        logger.info(f"Loading frequency-aware components for: {name} (Base: {base_name}, Suffix: '{gt_suffix}')")
+        
+        # Suffix handling for file paths
+        gt_sfx = f"_{gt_suffix}" if gt_suffix else ""
         
         try:
             # Load frequency map
-            map_path = proc_dir / "selected_column_frequency_map.json"
+            map_path = proc_dir / f"selected_column_frequency_map{gt_sfx}.json"
             if map_path.exists():
                 with open(map_path, "r") as f:
                     import json
@@ -255,8 +265,8 @@ class LocalDataManager:
             y.index = pd.to_datetime(y.index)
             y = y.sort_index()
             
-            if name == "gt_only":
-                X = pd.read_parquet(proc_dir / "selected_google_trends_monthly_prepared.parquet")
+            if base_name == "gt_only":
+                X = pd.read_parquet(proc_dir / f"selected_google_trends_monthly_prepared{gt_sfx}.parquet")
             else:
                 # Eurostat Monthly
                 X_m = pd.read_parquet(proc_dir / "selected_eurostat_monthly_prepared.parquet")
@@ -266,8 +276,8 @@ class LocalDataManager:
                 # Join preserves all dates. Quarterly columns will have NaNs for non-quarter-end months.
                 X = X_m.join(X_q, how="outer")
                 
-                if name == "common_plus_gt":
-                    X_gt = pd.read_parquet(proc_dir / "selected_google_trends_monthly_prepared.parquet")
+                if base_name == "common_plus_gt":
+                    X_gt = pd.read_parquet(proc_dir / f"selected_google_trends_monthly_prepared{gt_sfx}.parquet")
                     X = X.join(X_gt, how="outer")
             
             X.index = pd.to_datetime(X.index)
@@ -297,23 +307,4 @@ def map_to_target_quarter(date: pd.Timestamp) -> str:
     """Maps a date to a quarter label like '2026Q1'."""
     q = (date.month - 1) // 3 + 1
     return f"{date.year}Q{q}"
-
-def get_cutoff_dates_for_quarter(target_q_end: pd.Timestamp) -> List[Tuple[str, pd.Timestamp]]:
-    """
-    [DEPRECATED] 
-    This function is deprecated for the bachelor thesis evaluation. 
-    Use `nowcasting.data.vintage_builder.VintageBuilder` for strict pseudo-real-time 
-    vintage generation and truncation.
-    """
-    logger.warning("get_cutoff_dates_for_quarter is deprecated. Use VintageBuilder.")
-    vintages = []
-    labels = ["-2", "-1", "0", "+1", "+2"]
-    
-    # Base is 4 months before quarter end
-    base = target_q_end - pd.offsets.MonthEnd(4)
-    for i, label in enumerate(labels):
-        cutoff = base + pd.offsets.MonthEnd(i)
-        vintages.append((label, cutoff))
-        
-    return vintages
 

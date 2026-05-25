@@ -1,4 +1,3 @@
-import os
 import argparse
 import logging
 import json
@@ -6,7 +5,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from statsmodels.tsa.stattools import kpss, acf
-from typing import Optional, Dict, Tuple, List, Any
+from typing import Tuple
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -22,7 +21,7 @@ logger = logging.getLogger("frequency_prep")
 # ---------------------------------------------------------------------------
 
 def kpss_pvalue(x: pd.Series, regression: str = "c") -> float:
-    """KPSS p-value. Returns 1.0 if series is too short or test fails (conservative)."""
+    """KPSS p-value. Returns 1.0 if series is too short or test fails."""
     x = x.dropna()
     if len(x) < 10:
         return 1.0
@@ -149,6 +148,7 @@ def apply_stationarity_pipeline(s: pd.Series, freq: str, is_seasonal: bool, kpss
 
 def main():
     parser = argparse.ArgumentParser(description="Frequency-aware data preparation for selected Eurostat and GT data.")
+    parser.add_argument("--gt-suffix", type=str, default="", help="Suffix for Google Trends input files (e.g. v1 or lt)")
     parser.add_argument("--gt-transform", type=str, default="yoy", choices=["level", "diff", "yoy"], help="Google Trends transformation")
     parser.add_argument("--kpss-alpha", type=float, default=0.05, help="KPSS alpha for stationarity test")
     parser.add_argument("--min-obs-monthly", type=int, default=36, help="Min observations for monthly series")
@@ -161,12 +161,18 @@ def main():
     out_dir = project_root / "data" / "processed"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Suffix handling
+    gt_sfx = f"_{args.gt_suffix}" if args.gt_suffix else ""
+
     # Load Inputs
-    logger.info("Loading inputs...")
+    logger.info(f"Loading inputs (GT suffix: '{args.gt_suffix}')...")
     try:
         euro_meta = pd.read_csv(raw_dir / "selected_eurostat_metadata_for_prep.csv")
         euro_obs = pd.read_csv(raw_dir / "selected_eurostat_observations.csv")
-        gt_obs = pd.read_csv(raw_dir / "selected_google_trends_observations_monthend.csv")
+        
+        gt_obs_file = raw_dir / f"selected_google_trends_observations_monthend{gt_sfx}.csv"
+        logger.info(f"Using GT input: {gt_obs_file.name}")
+        gt_obs = pd.read_csv(gt_obs_file)
     except FileNotFoundError as e:
         logger.error(f"Input file not found: {e}")
         return
@@ -178,7 +184,7 @@ def main():
     summary = {
         "eurostat_monthly": {"input": 0, "kept": 0, "dropped": 0},
         "eurostat_quarterly": {"input": 0, "kept": 0, "dropped": 0},
-        "google_trends": {"input": 0, "kept": 0, "dropped": 0},
+        "google_trends": {"input": 0, "kept": 0, "dropped": 0, "suffix": args.gt_suffix},
         "transformations": {}
     }
     
@@ -244,11 +250,9 @@ def main():
         s = m_wide[sid]
         meta = euro_meta[euro_meta["series_id"] == sid].iloc[0]
         
-        # Diagnostics
         initial_non_nan = int(s.notna().sum())
         span_years = (s.dropna().index.max() - s.dropna().index.min()).days / 365.25 if initial_non_nan > 1 else 0
         
-        # Filters
         dropped_reason = None
         if initial_non_nan < args.min_obs_monthly:
             dropped_reason = f"too_few_obs_{initial_non_nan}<{args.min_obs_monthly}"
@@ -309,7 +313,6 @@ def main():
     q_reports = []
 
     for sid in q_wide.columns:
-        # POINT 2: Remove GDP target from quarterly predictors
         if gdp_sid and sid == gdp_sid:
             logger.info(f"Excluding GDP target {sid} from quarterly predictors.")
             q_reports.append({"series_id": sid, "frequency": "Q", "status": "target_excluded"})
@@ -394,7 +397,6 @@ def main():
 
         s_imputed = custom_impute(s)
         
-        # Transform
         if args.gt_transform == "diff":
             z = s_imputed.diff(1)
         elif args.gt_transform == "yoy":
@@ -421,10 +423,12 @@ def main():
 
     summary["google_trends"]["kept"] = len(gt_prepared.columns)
     
-    # Save GT
-    gt_prepared.to_parquet(out_dir / "selected_google_trends_monthly_prepared.parquet")
-    gt_prepared.to_csv(out_dir / "selected_google_trends_monthly_prepared.csv")
-    pd.DataFrame(gt_reports).to_csv(out_dir / "selected_google_trends_monthly_report.csv", index=False)
+    # Save GT with suffix
+    gt_out_file = f"selected_google_trends_monthly_prepared{gt_sfx}.parquet"
+    logger.info(f"Saving GT prepared data to: {gt_out_file}")
+    gt_prepared.to_parquet(out_dir / gt_out_file)
+    gt_prepared.to_csv(out_dir / gt_out_file.replace(".parquet", ".csv"))
+    pd.DataFrame(gt_reports).to_csv(out_dir / f"selected_google_trends_monthly_report{gt_sfx}.csv", index=False)
 
     # ---------------------------------------------------------
     # 6. GDP Target
@@ -434,13 +438,10 @@ def main():
         gdp_s["period_date"] = gdp_s["period_date"] + pd.offsets.QuarterEnd(0)
         gdp_s = gdp_s.groupby("period_date")["value"].mean().sort_index()
         
-        # Raw save
         gdp_s.to_frame("gdp_index").to_parquet(out_dir / "gdp_target_quarterly_raw.parquet")
         
-        # Transformed: YoY log difference
         gdp_target = np.log(gdp_s).diff(4)
         gdp_target.name = "gdp_target"
-        
         gdp_target.to_frame().to_parquet(out_dir / "gdp_target_quarterly.parquet")
         
         summary["gdp_target"] = {
@@ -454,10 +455,12 @@ def main():
         pd.DataFrame([summary["gdp_target"]]).to_csv(out_dir / "gdp_target_quarterly_report.csv", index=False)
 
     # ---------------------------------------------------------
-    # 7. Metadata / Frequency Map
+    # 7. Metadata / Frequency Map with suffix
     # ---------------------------------------------------------
-    with open(out_dir / "selected_column_frequency_map.json", "w") as f:
+    map_out_file = out_dir / f"selected_column_frequency_map{gt_sfx}.json"
+    with open(map_out_file, "w") as f:
         json.dump(col_freq_map, f, indent=4)
+    logger.info(f"Saved frequency map to: {map_out_file.name}")
 
     # ---------------------------------------------------------
     # 8. Final Summary
@@ -468,11 +471,11 @@ def main():
         "google_trends": [str(gt_prepared.index.min().date()), str(gt_prepared.index.max().date())] if not gt_prepared.empty else []
     }
     
-    with open(out_dir / "selected_frequency_aware_preparation_summary.json", "w") as f:
+    summary_out_file = out_dir / f"selected_frequency_aware_preparation_summary{gt_sfx}.json"
+    with open(summary_out_file, "w") as f:
         json.dump(summary, f, indent=4)
         
     logger.info("Preparation complete.")
-    logger.info(f"Summary: {json.dumps(summary, indent=2)}")
 
 if __name__ == "__main__":
     main()

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Šitas failas skirtas google trends duomenims atsiųsti.
 Surenkami paieškos duomenis pagal raktinius žodžius ir šalis,
 transformuoja savaitinius duomenis į mėnesinį formatą, išsaugo neapdorotus duomenis,
@@ -168,78 +168,92 @@ def ingest_batch(batch: list[str], geo: str, geo_name: str, timeframe: str, mode
 
 def main(mode: str = "initial", max_workers: int = 2):
     config = _load_config()
-    gt_config = config.get("google_trends", {}) if isinstance(config, dict) else {}
-    if not gt_config:
-        logger.warning("No 'google_trends' section in config.")
+    if not isinstance(config, dict):
+        logger.warning("Invalid config format.")
         return
 
-    keywords = gt_config.get("keywords", [])
-    geos = gt_config.get("geos", gt_config.get("geo", ["LT"]))
-    if isinstance(geos, str):
-        geos = [geos]
-    timeframe = gt_config.get("timeframe", "today 5-y")
-
-    if not keywords:
-        logger.warning("No keywords found in google_trends config.")
+    # Find all dataset keys starting with google_trends
+    gt_keys = [k for k in config.keys() if str(k).startswith("google_trends")]
+    
+    if not gt_keys:
+        logger.warning("No 'google_trends*' sections found in config.")
         return
 
-    downloaded_at = datetime.now(timezone.utc)
-    vintage_at = downloaded_at
-    stamp = downloaded_at.strftime("%Y-%m-%dT%H%M%SZ")
+    for gt_key in gt_keys:
+        logger.info(f"--- Processing Google Trends dataset: {gt_key} ---")
+        gt_config = config.get(gt_key, {})
+        
+        keywords = gt_config.get("keywords", [])
+        geos = gt_config.get("geos", gt_config.get("geo", ["LT"]))
+        if isinstance(geos, str):
+            geos = [geos]
+        timeframe = gt_config.get("timeframe", "today 5-y")
 
-    inserted_total = 0
-    failed_batches = 0
+        if not keywords:
+            logger.warning(f"No keywords found in {gt_key} config.")
+            continue
 
-    batches = list(chunk_keywords(keywords, 5))
-    results = []
+        downloaded_at = datetime.now(timezone.utc)
+        vintage_at = downloaded_at
+        stamp = downloaded_at.strftime("%Y-%m-%dT%H%M%SZ")
 
-    for geo in geos:
-        geo_name = GEO_NAMES.get(geo, geo)
-        logger.info(f"Processing geo: {geo} ({geo_name})")
+        inserted_total = 0
+        failed_batches = 0
+
+        batches = list(chunk_keywords(keywords, 5))
+        results = []
+
+        for geo in geos:
+            geo_name = GEO_NAMES.get(geo, geo)
+            # Use gt_key directly as the dataset key in DB for consistency with export scripts
+            db_dataset_key = gt_key
+
+            logger.info(f"Processing geo: {geo} ({geo_name}) -> DB dataset: {db_dataset_key}")
+
+            with engine.begin() as conn:
+                provider_id = ensure_provider(conn, "google_trends", base_url="https://trends.google.com")
+                dataset_id = ensure_dataset(conn, provider_id, key=db_dataset_key, title=f"Google Trends — {db_dataset_key}")
+
+            if max_workers <= 1:
+                for b in batches:
+                    results.append(ingest_batch(b, geo, geo_name, timeframe, mode, downloaded_at, vintage_at, stamp, dataset_id))
+                    time.sleep(2)
+            else:
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    futs = {
+                        ex.submit(ingest_batch, b, geo, geo_name, timeframe, mode, downloaded_at, vintage_at, stamp, dataset_id): b
+                        for b in batches
+                    }
+                    for fut in as_completed(futs):
+                        results.append(fut.result())
+                        time.sleep(1)
+
+        for r in results:
+            inserted_total += int(r.get("inserted", 0))
+            failed_batches += int(r.get("failed", 0))
 
         with engine.begin() as conn:
             provider_id = ensure_provider(conn, "google_trends", base_url="https://trends.google.com")
-            dataset_id = ensure_dataset(conn, provider_id, key=geo_name, title=f"Google Trends — {geo_name}")
+            dataset_id = ensure_dataset(conn, provider_id, key=f"{gt_key}_summary", title=f"GT {gt_key} Summary")
+            log_ingestion(
+                conn,
+                dataset_id=dataset_id,
+                status="ok" if failed_batches == 0 else "ok_with_errors",
+                rows_inserted=inserted_total,
+                rows_failed=failed_batches,
+                details={
+                    "dataset_key": gt_key,
+                    "geos": list(geos),
+                    "timeframe": timeframe,
+                    "keywords": len(keywords),
+                    "downloaded_at": downloaded_at.isoformat(),
+                    "vintage_at": vintage_at.isoformat(),
+                    "inserted_total": inserted_total,
+                    "failed_batches": failed_batches,
+                },
+            )
 
-        if max_workers <= 1:
-            for b in batches:
-                results.append(ingest_batch(b, geo, geo_name, timeframe, mode, downloaded_at, vintage_at, stamp, dataset_id))
-                time.sleep(2)
-        else:
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futs = {
-                    ex.submit(ingest_batch, b, geo, geo_name, timeframe, mode, downloaded_at, vintage_at, stamp, dataset_id): b
-                    for b in batches
-                }
-                for fut in as_completed(futs):
-                    results.append(fut.result())
-                    time.sleep(1)
-
-    for r in results:
-        inserted_total += int(r.get("inserted", 0))
-        failed_batches += int(r.get("failed", 0))
-
-    with engine.begin() as conn:
-        provider_id = ensure_provider(conn, "google_trends", base_url="https://trends.google.com")
-        dataset_id = ensure_dataset(conn, provider_id, key="__run_summary__", title="Google Trends Run Summary")
-        log_ingestion(
-            conn,
-            dataset_id=dataset_id,
-            status="ok" if failed_batches == 0 else "ok_with_errors",
-            rows_inserted=inserted_total,
-            rows_failed=failed_batches,
-            details={
-                "geos": list(geos),
-                "timeframe": timeframe,
-                "keywords": len(keywords),
-                "downloaded_at": downloaded_at.isoformat(),
-                "vintage_at": vintage_at.isoformat(),
-                "inserted_total": inserted_total,
-                "failed_batches": failed_batches,
-            },
-        )
-
-    logger.info(f"Google Trends done: inserted={inserted_total}, failed_batches={failed_batches}")
+        logger.info(f"Finished {gt_key}: inserted={inserted_total}, failed_batches={failed_batches}")
 
 
 if __name__ == "__main__":
